@@ -154,7 +154,7 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
     capabilities.digest_algorithms = vec!["blake3".into(), "sha256".into()];
     capabilities.compressors = vec!["identity".into(), "zstd".into()];
     capabilities.action_kinds = BTreeMap::from([
-        ("build-script".into(), ActionKindCapability::new(2, 1)),
+        ("build-script".into(), ActionKindCapability::new(5, 1)),
         ("cc".into(), ActionKindCapability::new(1, 1)),
         ("rustc".into(), ActionKindCapability::new(1, 1)),
         ("task".into(), ActionKindCapability::new(1, 1)),
@@ -978,10 +978,18 @@ fn validate_build_script_action(
     value: serde_json::Value,
     version: u64,
 ) -> Result<ActionKind, ApiError> {
-    if version != 2 {
+    if !matches!(version, 2 | 5) {
         return Err(ApiError::unprocessable(format!(
             "unsupported build-script action schema {version}"
         )));
+    }
+    let has_archive_timestamps = value
+        .as_object()
+        .is_some_and(|object| object.contains_key("archive_timestamps"));
+    if has_archive_timestamps != (version == 5) {
+        return Err(ApiError::unprocessable(
+            "invalid build-script action archive_timestamps field",
+        ));
     }
     let action =
         serde_json::from_value::<crate::model::BuildScriptAction>(value).map_err(|error| {
@@ -2141,7 +2149,7 @@ mod tests {
                 .unwrap();
         assert_eq!(body["action_kinds"]["task"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["task"]["metadata_schema"], 1);
-        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 2);
+        assert_eq!(body["action_kinds"]["build-script"]["action_schema"], 5);
         assert_eq!(body["action_kinds"]["build-script"]["metadata_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["action_schema"], 1);
         assert_eq!(body["action_kinds"]["cc"]["metadata_schema"], 1);
@@ -2234,6 +2242,68 @@ mod tests {
             .await,
             StatusCode::CREATED
         );
+    }
+
+    #[tokio::test]
+    async fn publishes_and_reads_build_script_schema_5() {
+        let binary_action = digest(b"build script binary action");
+        for archive_timestamps in [serde_json::Value::Null, serde_json::json!("1")] {
+            let (app, _directory) = test_app().await;
+            let mut action: serde_json::Value =
+                serde_json::from_slice(&build_script_action(&binary_action, 5)).unwrap();
+            action["archive_timestamps"] = archive_timestamps;
+            let bytes = canonical(action);
+            let action_digest = digest(&bytes);
+            assert_eq!(
+                publish_compiler_result(&app, &bytes, "build-script").await,
+                StatusCode::CREATED
+            );
+            let uri = format!(
+                "/v1/action-results/{}/{}/{}",
+                action_digest.algorithm, action_digest.hash, action_digest.size
+            );
+            let response = app
+                .clone()
+                .oneshot(request("GET", uri, Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: ActionResult =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body.action, action_digest);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_or_unsupported_build_script_schemas() {
+        let binary_action = digest(b"build script binary action");
+        let action = |version| -> serde_json::Value {
+            serde_json::from_slice(&build_script_action(&binary_action, version)).unwrap()
+        };
+        let mut old_with_new_field = action(2);
+        old_with_new_field["archive_timestamps"] = serde_json::Value::Null;
+        let mut bad_type = action(5);
+        bad_type["archive_timestamps"] = serde_json::json!(1);
+        let mut bad_value = action(5);
+        bad_value["archive_timestamps"] = serde_json::json!("bad\0value");
+        let mut unknown_field = action(5);
+        unknown_field["archive_timestamps"] = serde_json::Value::Null;
+        unknown_field["extra"] = serde_json::json!(true);
+        for invalid in [
+            action(5),
+            old_with_new_field,
+            bad_type,
+            bad_value,
+            unknown_field,
+            action(6),
+        ] {
+            let (app, _directory) = test_app().await;
+            assert_eq!(
+                publish_compiler_result(&app, &canonical(invalid), "build-script").await,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
     }
 
     #[tokio::test]

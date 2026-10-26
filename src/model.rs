@@ -176,6 +176,8 @@ pub struct CcInput {
 pub struct BuildScriptAction {
     pub version: u8,
     pub kind: String,
+    #[serde(default)]
+    pub archive_timestamps: Option<String>,
     pub binary_action: Digest,
     pub cargo_environment: BTreeMap<String, Option<String>>,
     pub environment: BTreeMap<String, Option<String>>,
@@ -385,8 +387,9 @@ impl CcInput {
 
 impl BuildScriptAction {
     pub fn validate(&self) -> bool {
-        self.version == 2
+        matches!(self.version, 2 | 5)
             && self.kind == "build-script"
+            && self.archive_timestamps.as_deref().is_none_or(valid_string)
             && self.binary_action.validate().is_ok()
             && valid_optional_string_map(&self.cargo_environment)
             && valid_optional_string_map(&self.environment)
