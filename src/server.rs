@@ -2546,6 +2546,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_blobs_in_a_pack_are_idempotent() {
+        let (app, _directory) = test_app().await;
+        let bytes = b"same blob";
+        let digest = digest(bytes);
+        let pack = encode_blob_pack(&[(&digest, bytes), (&digest, bytes)]);
+        let response = app
+            .oneshot(pack_request(pack, 2, digest.size * 2))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["created"], 1);
+        assert_eq!(body["existing"], 1);
+    }
+
+    #[tokio::test]
     async fn counts_blobs_an_uploaded_pack_already_held() {
         let (app, _directory) = test_app().await;
         let bytes = b"already held";
