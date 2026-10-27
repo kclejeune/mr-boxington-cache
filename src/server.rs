@@ -2258,6 +2258,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publishes_cc_results_with_path_binding_and_preprocessing() {
+        let (app, _directory) = test_app().await;
+        let input = digest(b"int widget(void) { return 42; }\n");
+        let mut action: serde_json::Value = serde_json::from_slice(&cc_action(&input, 1)).unwrap();
+        action["path_binding"] = serde_json::json!({
+            "working_dir":"/workspace",
+            "arguments":[
+                {"Plain":"-c"},
+                {"Path":{"flag":"-I","path":"/workspace/include"}},
+                {"PrefixMap":{"flag":"-fdebug-prefix-map=","from":"/workspace","to":"."}},
+                {"Source":"/workspace/widget.c"}
+            ],
+            "roots":{"${workspace}":"/workspace"}
+        });
+        assert_eq!(
+            publish_compiler_result(&app, &canonical(action.clone()), "cc").await,
+            StatusCode::CREATED
+        );
+        let (app, _directory) = test_app().await;
+        action.as_object_mut().unwrap().remove("path_binding");
+        action["preprocessing"] = serde_json::json!({
+            "working_dir":"/workspace",
+            "arguments":["-E", "widget.c"],
+            "roots":{"${workspace}":"/workspace"}
+        });
+        assert_eq!(
+            publish_compiler_result(&app, &canonical(action.clone()), "cc").await,
+            StatusCode::CREATED
+        );
+        let (app, _directory) = test_app().await;
+        action["preprocessing"]["unexpected"] = true.into();
+        assert_eq!(
+            publish_compiler_result(&app, &canonical(action), "cc").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
     async fn publishes_build_script_results() {
         let (app, _directory) = test_app().await;
         let binary_action = digest(b"build script binary action");

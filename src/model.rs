@@ -153,10 +153,46 @@ pub struct CcAction {
     pub adapter_version: u8,
     #[serde(default)]
     pub assembly_input_model: Option<u8>,
+    #[serde(default)]
+    pub path_binding: Option<CcPathBinding>,
+    #[serde(default)]
+    pub preprocessing: Option<CcPreprocessing>,
     pub compiler: CcCompiler,
     pub arguments: Vec<String>,
     pub environment: BTreeMap<String, Option<String>>,
     pub inputs: Vec<CcInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CcPathBinding {
+    pub working_dir: String,
+    pub arguments: Vec<CcBoundArgument>,
+    pub roots: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CcBoundArgument {
+    Plain(String),
+    Path {
+        flag: String,
+        path: String,
+    },
+    PrefixMap {
+        flag: String,
+        from: String,
+        to: String,
+    },
+    Source(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CcPreprocessing {
+    pub working_dir: String,
+    pub arguments: Vec<String>,
+    pub roots: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,6 +404,14 @@ impl CcAction {
             && self.kind == "cc"
             && self.adapter_version > 0
             && self.assembly_input_model.is_none_or(|version| version == 1)
+            && self
+                .path_binding
+                .as_ref()
+                .is_none_or(CcPathBinding::validate)
+            && self
+                .preprocessing
+                .as_ref()
+                .is_none_or(CcPreprocessing::validate)
             && self.compiler.validate()
             && valid_strings(&self.arguments)
             && valid_optional_string_map(&self.environment)
@@ -376,6 +420,36 @@ impl CcAction {
                 .inputs
                 .iter()
                 .all(|input| input.validate() && input_paths.insert(&input.path))
+    }
+}
+
+impl CcPathBinding {
+    fn validate(&self) -> bool {
+        !self.working_dir.is_empty()
+            && valid_string(&self.working_dir)
+            && valid_string_map(&self.roots)
+            && self.arguments.iter().all(CcBoundArgument::validate)
+    }
+}
+
+impl CcBoundArgument {
+    fn validate(&self) -> bool {
+        match self {
+            Self::Plain(value) | Self::Source(value) => valid_string(value),
+            Self::Path { flag, path } => valid_string(flag) && valid_string(path),
+            Self::PrefixMap { flag, from, to } => {
+                valid_string(flag) && valid_string(from) && valid_string(to)
+            }
+        }
+    }
+}
+
+impl CcPreprocessing {
+    fn validate(&self) -> bool {
+        !self.working_dir.is_empty()
+            && valid_string(&self.working_dir)
+            && valid_strings(&self.arguments)
+            && valid_string_map(&self.roots)
     }
 }
 
