@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream, stream::FuturesUnordered};
 use mbx_cache_protocol::{
     ACTION_RESULT_BATCH_MEDIA_TYPE, ActionKindCapability,
     BLOB_PACK_BLOBS_HEADER as PACK_BLOBS_HEADER, BLOB_PACK_BYTES_HEADER as PACK_BYTES_HEADER,
@@ -45,6 +45,8 @@ use crate::{
 
 const BLOB_PACK_HEADER_BYTES: usize = mbx_cache_protocol::BLOB_PACK_HEADER_BYTES as usize;
 const MAX_PACK_STORAGE_READS: usize = 16;
+const MAX_PACK_WRITES_PER_REQUEST: usize = 8;
+const MAX_PACK_WRITES_GLOBAL: usize = 32;
 const MAX_ACTION_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -54,6 +56,7 @@ pub struct AppState {
     pub auth: Authorizer,
     pub max_blob_bytes: u64,
     metrics: Arc<Metrics>,
+    pack_writes: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -69,6 +72,7 @@ impl AppState {
             auth,
             max_blob_bytes,
             metrics: Arc::new(Metrics::new()),
+            pack_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PACK_WRITES_GLOBAL)),
         }
     }
 }
@@ -317,6 +321,7 @@ async fn put_blob_pack(
     let mut frame: Option<PackFrame> = None;
     let mut created = 0;
     let mut existing = 0;
+    let mut writes = FuturesUnordered::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
         for event in reader.push(&chunk).map_err(pack_error)? {
@@ -335,9 +340,21 @@ async fn put_blob_pack(
                     let finished = frame.take().ok_or_else(|| {
                         ApiError::internal("blob pack frame ended before it began")
                     })?;
-                    match finished.store(&state, &namespace).await? {
-                        PutOutcome::Created => created += 1,
-                        PutOutcome::AlreadyExists => existing += 1,
+                    let state = &state;
+                    let namespace = &namespace;
+                    writes.push(async move {
+                        let _permit = state
+                            .pack_writes
+                            .acquire()
+                            .await
+                            .map_err(ApiError::internal)?;
+                        finished.store(state, namespace).await
+                    });
+                    if writes.len() >= MAX_PACK_WRITES_PER_REQUEST {
+                        match writes.next().await.expect("a write is pending")? {
+                            PutOutcome::Created => created += 1,
+                            PutOutcome::AlreadyExists => existing += 1,
+                        }
                     }
                 }
             }
@@ -348,6 +365,12 @@ async fn put_blob_pack(
         return Err(ApiError::bad_request(
             "blob pack does not carry what its headers declared",
         ));
+    }
+    while let Some(outcome) = writes.next().await {
+        match outcome? {
+            PutOutcome::Created => created += 1,
+            PutOutcome::AlreadyExists => existing += 1,
+        }
     }
     state.metrics.inc_blob_pack_upload(reader.blobs());
     Ok((
@@ -2489,6 +2512,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packed_blobs_are_stored_concurrently() {
+        struct RendezvousStore(tokio::sync::Barrier);
+
+        #[async_trait::async_trait]
+        impl BlobStore for RendezvousStore {
+            async fn get(&self, _: &Digest) -> anyhow::Result<Option<crate::storage::Blob>> {
+                Ok(None)
+            }
+
+            async fn put(&self, _: &Digest, _: &std::path::Path) -> anyhow::Result<PutOutcome> {
+                self.0.wait().await;
+                Ok(PutOutcome::Created)
+            }
+        }
+
+        let blobs = Arc::new(RendezvousStore(tokio::sync::Barrier::new(2)));
+        let metadata = Arc::new(MemoryMetadata::default());
+        let auth = Authorizer::new(None, None, true, None).await.unwrap();
+        let app = router(AppState::new(blobs, metadata, auth, 1024 * 1024));
+        let first = digest(b"first");
+        let second = digest(b"second");
+        let pack = encode_blob_pack(&[(&first, b"first"), (&second, b"second")]);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            app.oneshot(pack_request(pack, 2, first.size + second.size)),
+        )
+        .await
+        .expect("both writes must run concurrently")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn counts_blobs_an_uploaded_pack_already_held() {
         let (app, _directory) = test_app().await;
         let bytes = b"already held";
@@ -2749,7 +2806,10 @@ mod tests {
         // Action input digests identify local source content; only result
         // metadata, diagnostics, and output artifacts are CAS references.
         let source = digest(b"pub fn widget() {}\n");
-        let action = upload_blob(&app, &rustc_action(&source, 1)).await;
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
+        descriptor["compiler"]["driver"] = "clippy 0.1.99 (test)".into();
+        let action = upload_blob(&app, &canonical(descriptor)).await;
         let stdout = upload_blob(&app, b"").await;
         let stderr = upload_blob(&app, b"warning: cached diagnostic\n").await;
         let metadata = upload_blob(&app, &compiler_metadata("rustc", &stdout, &stderr, 1)).await;
@@ -2774,6 +2834,24 @@ mod tests {
                 .status(),
             StatusCode::CREATED
         );
+    }
+
+    #[test]
+    fn rustc_compiler_driver_is_optional_and_validated() {
+        let source = digest(b"pub fn widget() {}\n");
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&rustc_action(&source, 1)).unwrap();
+        assert!(validate_rustc_action(descriptor.clone(), 1).is_ok());
+        descriptor["compiler"]["driver"] = serde_json::Value::Null;
+        assert!(validate_rustc_action(descriptor.clone(), 1).is_ok());
+        descriptor["compiler"]["driver"] = "clippy 0.1.99 (test)".into();
+        assert!(validate_rustc_action(descriptor.clone(), 1).is_ok());
+        descriptor["compiler"]["driver"] = "".into();
+        assert!(validate_rustc_action(descriptor.clone(), 1).is_err());
+        descriptor["compiler"]["driver"] = "bad\u{0}driver".into();
+        assert!(validate_rustc_action(descriptor.clone(), 1).is_err());
+        descriptor["compiler"]["driver"] = 42.into();
+        assert!(validate_rustc_action(descriptor, 1).is_err());
     }
 
     #[tokio::test]
