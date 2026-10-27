@@ -117,6 +117,9 @@ pub struct RustcCompiler {
     pub toolchain: String,
     pub rustc_version: String,
     pub host: String,
+    /// The rustc driver when it is not rustc itself, such as clippy-driver.
+    #[serde(default)]
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,6 +329,10 @@ impl RustcCompiler {
         [&self.toolchain, &self.rustc_version, &self.host]
             .into_iter()
             .all(|value| !value.is_empty() && valid_string(value))
+            && self
+                .driver
+                .as_deref()
+                .is_none_or(|value| !value.is_empty() && valid_string(value))
     }
 }
 
@@ -475,6 +482,28 @@ mod tests {
         };
 
         assert!(compiler.validate());
+    }
+
+    #[test]
+    fn rustc_compilers_accept_an_optional_driver() {
+        let compiler: RustcCompiler = serde_json::from_str(
+            r#"{"toolchain":"stable","rustc_version":"rustc 1.92.0","host":"x86_64-unknown-linux-gnu"}"#,
+        )
+        .unwrap();
+        assert!(compiler.driver.is_none());
+        assert!(compiler.validate());
+
+        let clippy = RustcCompiler {
+            driver: Some("clippy-driver 0.1.92".into()),
+            ..compiler.clone()
+        };
+        assert!(clippy.validate());
+
+        let empty = RustcCompiler {
+            driver: Some(String::new()),
+            ..compiler
+        };
+        assert!(!empty.validate());
     }
 
     #[test]
