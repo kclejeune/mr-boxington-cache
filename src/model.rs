@@ -6,6 +6,7 @@ pub use mbx_cache_protocol::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
+use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,12 +172,17 @@ pub struct CcInput {
     pub path: String,
 }
 
+/// Accepted build-script action schemas; the last is advertised as current.
+/// Schemas 3 through 5 share one shape: mbx bumped the version only to keep
+/// results stored under an older policy from being reused. The version is part
+/// of the action digest, so the schemas never share a cache key.
+pub const BUILD_SCRIPT_ACTION_SCHEMAS: RangeInclusive<u8> = 2..=5;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildScriptAction {
     pub version: u8,
     pub kind: String,
-    #[serde(default)]
     pub archive_timestamps: Option<String>,
     pub binary_action: Digest,
     pub cargo_environment: BTreeMap<String, Option<String>>,
@@ -387,7 +393,7 @@ impl CcInput {
 
 impl BuildScriptAction {
     pub fn validate(&self) -> bool {
-        matches!(self.version, 2 | 5)
+        BUILD_SCRIPT_ACTION_SCHEMAS.contains(&self.version)
             && self.kind == "build-script"
             && self.archive_timestamps.as_deref().is_none_or(valid_string)
             && self.binary_action.validate().is_ok()

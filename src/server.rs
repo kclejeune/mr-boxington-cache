@@ -36,8 +36,8 @@ use crate::{
     metadata::{CommitOutcome, ManifestCommitOutcome, MetadataStore},
     metrics::Metrics,
     model::{
-        ActionResult, Algorithm, Digest, Directory, RustcAction, RustcMetadata, TaskAction,
-        TaskActionManifest, TaskMetadata,
+        ActionResult, Algorithm, BUILD_SCRIPT_ACTION_SCHEMAS, Digest, Directory, RustcAction,
+        RustcMetadata, TaskAction, TaskActionManifest, TaskMetadata,
     },
     pack::{PackError, PackEvent, PackReader},
     storage::{BlobStore, PutOutcome},
@@ -154,7 +154,10 @@ async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
     capabilities.digest_algorithms = vec!["blake3".into(), "sha256".into()];
     capabilities.compressors = vec!["identity".into(), "zstd".into()];
     capabilities.action_kinds = BTreeMap::from([
-        ("build-script".into(), ActionKindCapability::new(5, 1)),
+        (
+            "build-script".into(),
+            ActionKindCapability::new(*BUILD_SCRIPT_ACTION_SCHEMAS.end(), 1),
+        ),
         ("cc".into(), ActionKindCapability::new(1, 1)),
         ("rustc".into(), ActionKindCapability::new(1, 1)),
         ("task".into(), ActionKindCapability::new(1, 1)),
@@ -978,15 +981,17 @@ fn validate_build_script_action(
     value: serde_json::Value,
     version: u64,
 ) -> Result<ActionKind, ApiError> {
-    if !matches!(version, 2 | 5) {
+    if !u8::try_from(version).is_ok_and(|version| BUILD_SCRIPT_ACTION_SCHEMAS.contains(&version)) {
         return Err(ApiError::unprocessable(format!(
             "unsupported build-script action schema {version}"
         )));
     }
+    // Schema 3 added archive_timestamps, which mbx always serializes, as null
+    // when no archive policy applies.
     let has_archive_timestamps = value
         .as_object()
         .is_some_and(|object| object.contains_key("archive_timestamps"));
-    if has_archive_timestamps != (version == 5) {
+    if has_archive_timestamps != (version >= 3) {
         return Err(ApiError::unprocessable(
             "invalid build-script action archive_timestamps field",
         ));
@@ -2245,33 +2250,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishes_and_reads_build_script_schema_5() {
+    async fn publishes_and_reads_build_script_schemas_3_through_5() {
         let binary_action = digest(b"build script binary action");
-        for archive_timestamps in [serde_json::Value::Null, serde_json::json!("1")] {
-            let (app, _directory) = test_app().await;
-            let mut action: serde_json::Value =
-                serde_json::from_slice(&build_script_action(&binary_action, 5)).unwrap();
-            action["archive_timestamps"] = archive_timestamps;
-            let bytes = canonical(action);
-            let action_digest = digest(&bytes);
-            assert_eq!(
-                publish_compiler_result(&app, &bytes, "build-script").await,
-                StatusCode::CREATED
-            );
-            let uri = format!(
-                "/v1/action-results/{}/{}/{}",
-                action_digest.algorithm, action_digest.hash, action_digest.size
-            );
-            let response = app
-                .clone()
-                .oneshot(request("GET", uri, Body::empty()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body: ActionResult =
-                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+        for version in 3..=5 {
+            for archive_timestamps in [serde_json::Value::Null, serde_json::json!("1")] {
+                let (app, _directory) = test_app().await;
+                let mut action: serde_json::Value =
+                    serde_json::from_slice(&build_script_action(&binary_action, version)).unwrap();
+                action["archive_timestamps"] = archive_timestamps;
+                let bytes = canonical(action);
+                let action_digest = digest(&bytes);
+                assert_eq!(
+                    publish_compiler_result(&app, &bytes, "build-script").await,
+                    StatusCode::CREATED
+                );
+                let uri = format!(
+                    "/v1/action-results/{}/{}/{}",
+                    action_digest.algorithm, action_digest.hash, action_digest.size
+                );
+                let response = app
+                    .clone()
+                    .oneshot(request("GET", uri, Body::empty()))
+                    .await
                     .unwrap();
-            assert_eq!(body.action, action_digest);
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: ActionResult = serde_json::from_slice(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap();
+                assert_eq!(body.action, action_digest);
+            }
         }
     }
 
@@ -2290,13 +2298,18 @@ mod tests {
         let mut unknown_field = action(5);
         unknown_field["archive_timestamps"] = serde_json::Value::Null;
         unknown_field["extra"] = serde_json::json!(true);
+        let mut too_new = action(6);
+        too_new["archive_timestamps"] = serde_json::Value::Null;
         for invalid in [
+            action(1),
+            action(3),
+            action(4),
             action(5),
             old_with_new_field,
             bad_type,
             bad_value,
             unknown_field,
-            action(6),
+            too_new,
         ] {
             let (app, _directory) = test_app().await;
             assert_eq!(
