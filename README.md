@@ -233,6 +233,11 @@ Treat the output as a secret even though it is short-lived. Set the audience in 
 
 ## Deployment
 
+A Cloudflare Workers target with R2 blob storage and D1 metadata is available in
+[`workers/`](workers/README.md). It shares the native action validators and
+implements streaming blobs, packs, action results, and manifests. See that
+README for local setup, deployment, and initial feature limits.
+
 - `docker-compose.yml` runs a local development stack with PostgreSQL and MinIO.
 - `charts/mbx-cache` runs a horizontally scalable Kubernetes deployment.
 - [`deploy/azure`](deploy/azure/README.md) provisions a low-cost US production

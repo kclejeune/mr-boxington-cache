@@ -1,0 +1,16 @@
+{
+  "name": "mbx-cache-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "worker-build --release",
+    "test": "node --test tests/*.test.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@noble/hashes": "^2.4.0",
+    "miniflare": "^5.20261023.2-beta",
+    "wrangler": "^4.149.0"
+  }
+}

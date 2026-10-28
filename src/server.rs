@@ -1,3 +1,7 @@
+use crate::validation::{
+    validate_action_descriptor, validate_action_result_shape, validate_client_metadata,
+    validate_tree,
+};
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
@@ -35,10 +39,7 @@ use crate::{
     auth::{Access, Authorizer},
     metadata::{CommitOutcome, ManifestCommitOutcome, MetadataStore},
     metrics::Metrics,
-    model::{
-        ActionResult, Algorithm, BUILD_SCRIPT_ACTION_SCHEMAS, Digest, Directory, RustcAction,
-        RustcMetadata, TaskAction, TaskActionManifest, TaskMetadata,
-    },
+    model::{ActionResult, Algorithm, BUILD_SCRIPT_ACTION_SCHEMAS, Digest, TaskActionManifest},
     pack::{PackError, PackEvent, PackReader},
     storage::{BlobStore, PutOutcome},
 };
@@ -855,476 +856,51 @@ async fn put_action_manifest(
         .map_err(ApiError::internal)
 }
 
-async fn require_blob(
-    state: &AppState,
-    namespace: &str,
-    digest: &Digest,
-    label: &str,
-) -> Result<(), ApiError> {
-    validate_digest(digest)?;
-    if state
-        .metadata
-        .blob_visible(namespace, digest)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        Ok(())
-    } else {
-        Err(ApiError::unprocessable(format!("{label} is missing")))
-    }
-}
-
-async fn validate_tree(state: &AppState, namespace: &str, root: &Digest) -> Result<(), ApiError> {
-    enum Visit {
-        Enter(Digest),
-        Exit(Digest),
-    }
-
-    let mut pending = vec![Visit::Enter(root.clone())];
-    let mut visiting = HashSet::new();
-    let mut seen = HashSet::new();
-    while let Some(visit) = pending.pop() {
-        let digest = match visit {
-            Visit::Exit(digest) => {
-                visiting.remove(&digest);
-                seen.insert(digest);
-                continue;
-            }
-            Visit::Enter(digest) => digest,
-        };
-        if seen.contains(&digest) {
-            continue;
-        }
-        if !visiting.insert(digest.clone()) {
-            return Err(ApiError::unprocessable("directory graph contains a cycle"));
-        }
-        if seen.len() + visiting.len() > 100_000 {
-            return Err(ApiError::unprocessable("directory graph is too large"));
-        }
-        if digest.size > 16 * 1024 * 1024 {
-            return Err(ApiError::unprocessable("directory object is too large"));
-        }
-        if !state
-            .metadata
-            .blob_visible(namespace, &digest)
+impl crate::validation::ValidationStore for AppState {
+    async fn visible(
+        &self,
+        namespace: &str,
+        digests: &[Digest],
+    ) -> Result<Vec<Digest>, crate::validation::ValidationError> {
+        self.metadata
+            .visible_blobs(namespace, digests)
             .await
-            .map_err(ApiError::internal)?
-        {
-            return Err(ApiError::unprocessable("directory object is missing"));
-        }
-        let mut blob = state
+            .map_err(crate::validation::ValidationError::internal)
+    }
+    async fn read(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<Vec<u8>>, crate::validation::ValidationError> {
+        use crate::validation::ValidationError;
+        let Some(mut blob) = self
             .blobs
-            .get(&digest)
+            .get(digest)
             .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::unprocessable("directory object is missing"))?;
-        let mut bytes = Vec::with_capacity(digest.size as usize);
+            .map_err(ValidationError::internal)?
+        else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
         while let Some(chunk) = blob.stream.next().await {
-            bytes.extend_from_slice(&chunk.map_err(ApiError::internal)?);
+            let chunk = chunk.map_err(ValidationError::internal)?;
+            if bytes.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 {
+                return Err(ValidationError::unprocessable(
+                    "protocol object is too large",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        let directory: Directory = serde_json::from_slice(&bytes)
-            .map_err(|_| ApiError::unprocessable("directory object is invalid"))?;
-        if serde_json::to_vec(&directory).map_err(ApiError::internal)? != bytes {
-            return Err(ApiError::unprocessable(
-                "directory object is not canonical JSON",
-            ));
+        Ok(Some(bytes))
+    }
+}
+
+impl From<crate::validation::ValidationError> for ApiError {
+    fn from(error: crate::validation::ValidationError) -> Self {
+        if error.status == 500 {
+            return Self::internal(error.message);
         }
-        if directory.version != 1 {
-            return Err(ApiError::unprocessable(
-                "unsupported directory object version",
-            ));
-        }
-        validate_directory_entries(&directory)?;
-        for file in directory.files {
-            require_blob(state, namespace, &file.digest, "file blob").await?;
-        }
-        pending.push(Visit::Exit(digest));
-        pending.extend(
-            directory
-                .directories
-                .into_iter()
-                .map(|node| Visit::Enter(node.digest)),
-        );
+        Self::new(StatusCode::from_u16(error.status).unwrap(), error.message)
     }
-    Ok(())
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ActionKind {
-    BuildScript,
-    Cc,
-    Rustc,
-    Task,
-}
-
-fn validate_action_result_shape(
-    result: &ActionResult,
-    action_kind: ActionKind,
-) -> Result<(), ApiError> {
-    if action_kind != ActionKind::Task
-        && (result.metadata.is_none() || result.output_root.is_none())
-    {
-        return Err(ApiError::unprocessable(
-            "compiler action results require metadata and an output root",
-        ));
-    }
-    Ok(())
-}
-
-async fn validate_action_descriptor(
-    state: &AppState,
-    namespace: &str,
-    digest: &Digest,
-) -> Result<ActionKind, ApiError> {
-    let value = read_canonical_object(state, namespace, digest, "action descriptor").await?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| ApiError::unprocessable("action descriptor must be a JSON object"))?;
-    let kind = object
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ApiError::unprocessable("action descriptor kind is required"))?
-        .to_owned();
-    let version = object
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| ApiError::unprocessable("action descriptor version is required"))?;
-    match kind.as_str() {
-        "build-script" => validate_build_script_action(value, version),
-        "cc" => validate_cc_action(value, version),
-        "task" => validate_task_action(value, version),
-        "rustc" => validate_rustc_action(value, version),
-        _ => Err(ApiError::unprocessable(format!(
-            "unsupported action kind {kind:?}"
-        ))),
-    }
-}
-
-fn validate_build_script_action(
-    value: serde_json::Value,
-    version: u64,
-) -> Result<ActionKind, ApiError> {
-    if !u8::try_from(version).is_ok_and(|version| BUILD_SCRIPT_ACTION_SCHEMAS.contains(&version)) {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported build-script action schema {version}"
-        )));
-    }
-    // Schema 3 added archive_timestamps, which mbx always serializes, as null
-    // when no archive policy applies.
-    let has_archive_timestamps = value
-        .as_object()
-        .is_some_and(|object| object.contains_key("archive_timestamps"));
-    if has_archive_timestamps != (version >= 3) {
-        return Err(ApiError::unprocessable(
-            "invalid build-script action archive_timestamps field",
-        ));
-    }
-    let action =
-        serde_json::from_value::<crate::model::BuildScriptAction>(value).map_err(|error| {
-            ApiError::unprocessable(format!("invalid build-script action: {error}"))
-        })?;
-    if !action.validate() {
-        return Err(ApiError::unprocessable(
-            "invalid build-script action values",
-        ));
-    }
-    Ok(ActionKind::BuildScript)
-}
-
-fn validate_cc_action(value: serde_json::Value, version: u64) -> Result<ActionKind, ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported cc action schema {version}"
-        )));
-    }
-    let action = serde_json::from_value::<crate::model::CcAction>(value)
-        .map_err(|error| ApiError::unprocessable(format!("invalid cc action: {error}")))?;
-    if !action.validate() {
-        return Err(ApiError::unprocessable("invalid cc action values"));
-    }
-    Ok(ActionKind::Cc)
-}
-
-fn validate_task_action(value: serde_json::Value, version: u64) -> Result<ActionKind, ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported task action schema {version}"
-        )));
-    }
-    let object = value
-        .as_object()
-        .expect("action descriptors are checked to be objects");
-    for field in [
-        "version",
-        "kind",
-        "task",
-        "phase",
-        "run",
-        "args",
-        "shell",
-        "outputs",
-        "root",
-        "source_hash",
-        "environment",
-        "vars",
-        "tools",
-        "os",
-        "arch",
-    ] {
-        if !object.contains_key(field) {
-            return Err(ApiError::unprocessable(format!(
-                "task action field {field:?} is required"
-            )));
-        }
-    }
-    let action = serde_json::from_value::<TaskAction>(value)
-        .map_err(|error| ApiError::unprocessable(format!("invalid task action: {error}")))?;
-    if !action.validate() {
-        return Err(ApiError::unprocessable("invalid task action values"));
-    }
-    Ok(ActionKind::Task)
-}
-
-fn validate_rustc_action(value: serde_json::Value, version: u64) -> Result<ActionKind, ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported rustc action schema {version}"
-        )));
-    }
-    let action = serde_json::from_value::<RustcAction>(value)
-        .map_err(|error| ApiError::unprocessable(format!("invalid rustc action: {error}")))?;
-    if !action.validate() {
-        return Err(ApiError::unprocessable("invalid rustc action values"));
-    }
-    Ok(ActionKind::Rustc)
-}
-
-async fn validate_client_metadata(
-    state: &AppState,
-    namespace: &str,
-    digest: &Digest,
-    action_kind: ActionKind,
-) -> Result<(), ApiError> {
-    let value = read_canonical_object(state, namespace, digest, "client metadata").await?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| ApiError::unprocessable("client metadata must be a JSON object"))?;
-    let kind = object
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ApiError::unprocessable("client metadata kind is required"))?;
-    let version = object
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| ApiError::unprocessable("client metadata version is required"))?;
-    let expected_kind = match action_kind {
-        ActionKind::BuildScript => "build-script",
-        ActionKind::Cc => "cc",
-        ActionKind::Rustc => "rustc",
-        ActionKind::Task => "task",
-    };
-    if kind != expected_kind {
-        return Err(ApiError::unprocessable(
-            "client metadata kind does not match action kind",
-        ));
-    }
-    match action_kind {
-        ActionKind::Task => validate_task_metadata(value, version),
-        ActionKind::BuildScript => {
-            validate_build_script_metadata(state, namespace, value, version).await
-        }
-        ActionKind::Cc => validate_cc_metadata(state, namespace, value, version).await,
-        ActionKind::Rustc => validate_rustc_metadata(state, namespace, value, version).await,
-    }
-}
-
-async fn validate_build_script_metadata(
-    state: &AppState,
-    namespace: &str,
-    value: serde_json::Value,
-    version: u64,
-) -> Result<(), ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported build-script metadata schema {version}"
-        )));
-    }
-    let metadata: crate::model::BuildScriptMetadata =
-        serde_json::from_value(value).map_err(|error| {
-            ApiError::unprocessable(format!("invalid build-script metadata: {error}"))
-        })?;
-    if !metadata.validate() {
-        return Err(ApiError::unprocessable(
-            "invalid build-script metadata values",
-        ));
-    }
-    require_output_blobs(
-        state,
-        namespace,
-        &metadata.stdout,
-        &metadata.stderr,
-        "build-script",
-    )
-    .await
-}
-
-async fn validate_cc_metadata(
-    state: &AppState,
-    namespace: &str,
-    value: serde_json::Value,
-    version: u64,
-) -> Result<(), ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported cc metadata schema {version}"
-        )));
-    }
-    let metadata: crate::model::CcMetadata = serde_json::from_value(value)
-        .map_err(|error| ApiError::unprocessable(format!("invalid cc metadata: {error}")))?;
-    if !metadata.validate() {
-        return Err(ApiError::unprocessable("invalid cc metadata values"));
-    }
-    require_output_blobs(state, namespace, &metadata.stdout, &metadata.stderr, "cc").await
-}
-
-fn validate_task_metadata(value: serde_json::Value, version: u64) -> Result<(), ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported task metadata schema {version}"
-        )));
-    }
-    let metadata: TaskMetadata = serde_json::from_value(value)
-        .map_err(|error| ApiError::unprocessable(format!("invalid task metadata: {error}")))?;
-    if !metadata.validate() {
-        return Err(ApiError::unprocessable("invalid task metadata values"));
-    }
-    for root in metadata.roots {
-        validate_task_root(&root)?;
-    }
-    Ok(())
-}
-
-async fn validate_rustc_metadata(
-    state: &AppState,
-    namespace: &str,
-    value: serde_json::Value,
-    version: u64,
-) -> Result<(), ApiError> {
-    if version != 1 {
-        return Err(ApiError::unprocessable(format!(
-            "unsupported rustc metadata schema {version}"
-        )));
-    }
-    let metadata: RustcMetadata = serde_json::from_value(value)
-        .map_err(|error| ApiError::unprocessable(format!("invalid rustc metadata: {error}")))?;
-    if !metadata.validate() {
-        return Err(ApiError::unprocessable("invalid rustc metadata values"));
-    }
-    require_output_blobs(
-        state,
-        namespace,
-        &metadata.stdout,
-        &metadata.stderr,
-        "rustc",
-    )
-    .await
-}
-
-async fn require_output_blobs(
-    state: &AppState,
-    namespace: &str,
-    stdout: &Digest,
-    stderr: &Digest,
-    kind: &str,
-) -> Result<(), ApiError> {
-    require_blob(state, namespace, stdout, &format!("{kind} stdout blob")).await?;
-    require_blob(state, namespace, stderr, &format!("{kind} stderr blob")).await
-}
-
-fn validate_task_root(root: &str) -> Result<(), ApiError> {
-    if root.is_empty()
-        || root.starts_with('/')
-        || root.contains(['\\', '\0'])
-        || root
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..")
-    {
-        return Err(ApiError::unprocessable(
-            "task metadata root must be a safe relative path",
-        ));
-    }
-    Ok(())
-}
-
-async fn read_canonical_object(
-    state: &AppState,
-    namespace: &str,
-    digest: &Digest,
-    label: &str,
-) -> Result<serde_json::Value, ApiError> {
-    validate_digest(digest)?;
-    if digest.size > 16 * 1024 * 1024 {
-        return Err(ApiError::unprocessable(format!("{label} is too large")));
-    }
-    if !state
-        .metadata
-        .blob_visible(namespace, digest)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        return Err(ApiError::unprocessable(format!("{label} blob is missing")));
-    }
-    let mut blob = state
-        .blobs
-        .get(digest)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::unprocessable(format!("{label} blob is missing")))?;
-    let mut bytes = Vec::with_capacity(digest.size as usize);
-    while let Some(chunk) = blob.stream.next().await {
-        bytes.extend_from_slice(&chunk.map_err(ApiError::internal)?);
-    }
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| ApiError::unprocessable(format!("{label} is invalid JSON")))?;
-    if !value.is_object() || serde_json::to_vec(&value).map_err(ApiError::internal)? != bytes {
-        return Err(ApiError::unprocessable(format!(
-            "{label} is not canonical JSON"
-        )));
-    }
-    Ok(value)
-}
-
-fn validate_directory_entries(directory: &Directory) -> Result<(), ApiError> {
-    let mut names = HashSet::new();
-    for node in &directory.directories {
-        validate_entry(&mut names, &node.name, node.mode)?;
-    }
-    for node in &directory.files {
-        validate_entry(&mut names, &node.name, node.mode)?;
-        let _ = node.executable;
-    }
-    for node in &directory.symlinks {
-        validate_entry(&mut names, &node.name, node.mode)?;
-        if node.target.is_empty() || node.target.contains('\0') {
-            return Err(ApiError::unprocessable("invalid symlink target"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_entry(names: &mut HashSet<String>, name: &str, mode: u32) -> Result<(), ApiError> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\\', '\0'])
-        || mode > 0o7777
-    {
-        return Err(ApiError::unprocessable("invalid directory entry"));
-    }
-    if !names.insert(name.to_owned()) {
-        return Err(ApiError::unprocessable("duplicate directory entry"));
-    }
-    Ok(())
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -1449,9 +1025,6 @@ impl ApiError {
     pub fn too_large(message: impl ToString) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, message)
     }
-    pub fn unprocessable(message: impl ToString) -> Self {
-        Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
-    }
     pub fn precondition(message: impl ToString) -> Self {
         Self::new(StatusCode::PRECONDITION_FAILED, message)
     }
@@ -1487,6 +1060,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::validate_rustc_action;
     use crate::{metadata::MemoryMetadata, storage::FilesystemStore};
     use http_body_util::BodyExt;
     use tower::ServiceExt;

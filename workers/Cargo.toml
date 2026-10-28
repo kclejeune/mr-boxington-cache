@@ -1,0 +1,26 @@
+[package]
+name = "mbx-cache-worker"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-stream = "0.3"
+worker-sys = "0.8.7"
+blake3 = { version = "1", features = ["pure"] }
+futures-util = "0.3"
+hex = "0.4"
+mbx-cache-protocol = "=0.5.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+worker = { version = "0.8.7", features = ["d1"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["ReadableStream", "WritableStream", "WritableStreamDefaultWriter"] }
+
+[workspace]

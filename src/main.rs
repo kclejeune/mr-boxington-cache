@@ -6,6 +6,7 @@ mod model;
 mod pack;
 mod server;
 mod storage;
+mod validation;
 
 use anyhow::Result;
 use clap::Parser;

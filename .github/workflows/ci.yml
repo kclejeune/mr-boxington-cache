@@ -147,12 +147,44 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
+  workers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: workers
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          version: 2026.10.18
+          install: false
+          cache: false
+      - run: mise install node@24
+      - name: Install Rust components
+        run: |
+          rustup target add wasm32-unknown-unknown
+          rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: workers
+      - run: cargo install worker-build --version 0.8.7 --locked
+      - run: mise exec node@24 -- node --version
+      - run: mise exec node@24 -- npm ci
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+      - run: mise exec node@24 -- npm run build
+      - run: mise exec node@24 -- npm test
+
   final:
     permissions: {}
     needs:
       - deployment
       - hk
       - test
+      - workers
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run on success or upstream failure but skip when the workflow is cancelled
@@ -163,6 +195,7 @@ jobs:
         if: |
           needs.deployment.result != 'success' ||
           needs.hk.result != 'success' ||
-          needs.test.result != 'success'
+          needs.test.result != 'success' ||
+          needs.workers.result != 'success'
         run: exit 1
       - run: echo "All CI jobs completed successfully"
