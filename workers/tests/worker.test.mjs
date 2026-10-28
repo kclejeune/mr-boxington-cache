@@ -2,21 +2,74 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, sign, constants as cconst } from 'node:crypto';
+import { zstdCompressSync, constants as zconst } from 'node:zlib';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { blake3 } from '@noble/hashes/blake3.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const packType = 'application/vnd.mbx.cache-blob-pack.v1';
 let mf, db, bucket;
-before(async () => {
-  mf = new Miniflare(convertV4MiniflareOptions({ workers: [{
+let oidcKeys, rotatedKeys, ecKeys, ec384Keys, edKeys;
+let rotated=false, failFallback=false;
+const outboundCounts=new Map();
+const providers=['issuer','direct','mismatch','fallback'].map(name=>({
+  issuer:`https://${name}.test`,audiences:['https://cache.example'],
+  ...(name==='direct'?{jwks_uri:'https://direct.test/keys'}:{}),
+  algorithms:['RS256','RS384','RS512','PS256','PS384','PS512','ES256','ES384','EdDSA'],jwks_refresh_seconds:1,clock_skew_seconds:0,
+  rules:[
+    {claims:{repository:'acme/project',repository_owner_id:'123'},read:['test/*'],write:[]},
+    {claims:{repository:'acme/project',repository_owner_id:'123',event_name:'push',ref_type:'branch',ref:'refs/heads/main'},read:['test/*'],write:['test/*']},
+    {claims:{groups:['ci','build'],trusted:true,level:2},read:['test/*'],write:[]},
+  ],
+}));
+function jwk(keys,kid,alg='RS256',extra={}) {
+  return {...keys.publicKey.export({format:'jwk'}),kid,alg,use:'sig',key_ops:['verify'],...extra};
+}
+async function outbound(request) {
+  const url=new URL(request.url);
+  outboundCounts.set(url.href,(outboundCounts.get(url.href)||0)+1);
+  if (url.pathname==='/.well-known/openid-configuration') {
+    return Response.json({issuer:url.hostname==='mismatch.test'?'https://wrong.test':url.origin,
+      jwks_uri:`${url.origin}/keys`,id_token_signing_alg_values_supported:['RS256','RS384','RS512','PS256','PS384','PS512','ES256','ES384','EdDSA']});
+  }
+  if (url.pathname==='/keys') {
+    if (url.hostname==='fallback.test' && failFallback) return new Response('unavailable',{status:503});
+    const keys=url.hostname==='issuer.test' && rotated?rotatedKeys:oidcKeys;
+    return Response.json({keys:[
+      jwk(keys,rotated && url.hostname==='issuer.test'?'rotated-key':'rsa-key'),
+      jwk(ecKeys,'ec-key','ES256'),jwk(ec384Keys,'ec384-key','ES384'),jwk(edKeys,'ed-key','EdDSA'),
+      ...['RS384','RS512','PS256','PS384','PS512'].map(alg=>jwk(keys,`${alg}-key`,alg)),
+      jwk(oidcKeys,'bad-use','RS256',{use:'enc'}),
+      jwk(oidcKeys,'bad-alg','RS512'),jwk(oidcKeys,'bad-ops','RS256',{key_ops:['sign']}),
+    ]});
+  }
+  return new Response('not found',{status:404});
+}
+function jwt(claims={},options={}) {
+  const algorithm=options.algorithm||'RS256';
+  const key=options.key||oidcKeys.privateKey;
+  const header={alg:algorithm,kid:options.kid||'rsa-key',typ:'JWT',...options.header};
+  const payload={iss:'https://issuer.test',aud:'https://cache.example',sub:'repo:acme/project',
+    exp:Math.floor(Date.now()/1000)+300,repository:'acme/project',repository_owner_id:'123',
+    event_name:'push',ref_type:'branch',ref:'refs/heads/main',...claims};
+  const input=[header,payload].map(v=>Buffer.from(JSON.stringify(v)).toString('base64url')).join('.');
+  const signature=algorithm==='HS256'?createHmac('sha256','secret').update(input).digest():
+    sign(algorithm==='EdDSA'?null:algorithm.endsWith('384')?'sha384':algorithm.endsWith('512')?'sha512':'sha256',Buffer.from(input),
+      algorithm.startsWith('ES')?{key,dsaEncoding:'ieee-p1363'}:
+      algorithm.startsWith('PS')?{key,padding:cconst.RSA_PKCS1_PSS_PADDING,saltLength:algorithm.endsWith('384')?48:algorithm.endsWith('512')?64:32}:key);
+  return `${input}.${signature.toString('base64url')}`;
+}
+function runtime(bindings={}) {
+  return new Miniflare(convertV4MiniflareOptions({ workers: [{
     name: "mbx-cache",
     modulesRoot: `${root}build`,
     modules: [
       {type:'ESModule',path:`${root}build/index.js`},
       {type:'CompiledWasm',path:`${root}build/index_bg.wasm`},
     ],
+    outboundService: outbound,
     compatibilityDate: '2026-10-28',
     d1Databases: ['MBX_DB'], r2Buckets: ['MBX_BLOBS'],
     bindings: {
@@ -26,8 +79,18 @@ before(async () => {
       ]),
       MBX_CACHE_ANONYMOUS_READ_NAMESPACES_JSON: '["public/*"]',
       MBX_CACHE_MAX_BLOB_BYTES: '67108864',
+      MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify(providers),
+      ...bindings,
     },
   }] }));
+}
+before(async () => {
+  oidcKeys=generateKeyPairSync('rsa',{modulusLength:2048});
+  rotatedKeys=generateKeyPairSync('rsa',{modulusLength:2048});
+  ecKeys=generateKeyPairSync('ec',{namedCurve:'prime256v1'});
+  edKeys=generateKeyPairSync('ed25519');
+  ec384Keys=generateKeyPairSync('ec',{namedCurve:'secp384r1'});
+  mf=runtime();
   db = await mf.getD1Database('MBX_DB');
   bucket = await mf.getR2Bucket('MBX_BLOBS');
   const schema = await readFile(`${root}migrations/0001_init.sql`, 'utf8');
@@ -75,7 +138,7 @@ test('capabilities advertise only supported features and encodings', async () =>
   const response = await request('/v1/capabilities');
   assert.equal(response.status,200);
   const c = await response.json();
-  assert.deepEqual(c.compressors,['identity']);
+  assert.deepEqual(c.compressors,['identity','zstd']);
   assert.equal(c.features.blob_pack_uploads,true);
   assert.equal(c.features.action_promises,false);
   assert.equal(c.limits.max_batch_items,512);
@@ -115,7 +178,7 @@ test('bad hashes, sizes and unsupported encoding never gain namespace visibility
     assert.ok([400,413].includes(response.status),`${response.status}: ${await response.text()}`);
     assert.equal((await request(url)).status,404);
   }
-  assert.equal((await request(url,'PUT',bytes,{'if-none-match':'*','content-encoding':'zstd'})).status,415);
+  assert.equal((await request(url,'PUT',bytes,{'if-none-match':'*','content-encoding':'gzip'})).status,415);
   await put(bytes);
   assert.equal((await request(url,'GET',undefined,{'mbx-cache-namespace':'test/other'})).status,404);
   const missing=await request('/v1/blobs:missing','POST',JSON.stringify({digests:[d]}),{'mbx-cache-namespace':'test/other'});
@@ -260,4 +323,158 @@ test('cross-namespace deduplication still requires proof of blob content', async
   assert.equal(await (await request(path('blobs',d),'GET',undefined,headers)).text(),bytes.toString());
   const after=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(key).first();
   assert.deepEqual(after,before);
+});
+
+function compressed(bytes, checksum=true) {
+  return zstdCompressSync(bytes,{params:{[zconst.ZSTD_c_contentSizeFlag]:0,[zconst.ZSTD_c_checksumFlag]:Number(checksum)}});
+}
+function streaming(bytes, n=3) {
+  let offset=0;
+  return new ReadableStream({pull(controller) {
+    if(offset===bytes.length) return controller.close();
+    const end=Math.min(bytes.length,offset+n);controller.enqueue(bytes.subarray(offset,end));offset=end;
+  }});
+}
+test('zstd uploads stream BLAKE3/SHA256 bodies, concatenated frames and skippable frames', async () => {
+  for(const algorithm of ['blake3','sha256']) {
+    for(const bytes of [Buffer.alloc(0),Buffer.alloc(3*1024*1024,80)]) {
+      const d=digest(bytes,algorithm),encoded=compressed(bytes);
+      const response=await request(path('blobs',d),'PUT',streaming(encoded,7),{'if-none-match':'*','content-encoding':'zstd'});
+      assert.ok([201,204].includes(response.status),`${response.status}: ${await response.text()}`);
+      assert.deepEqual(Buffer.from(await (await request(path('blobs',d))).arrayBuffer()),bytes);
+    }
+  }
+  const a=Buffer.from('multi-frame-a'),b=Buffer.from('multi-frame-b');
+  const skip=Buffer.from([0x50,0x2a,0x4d,0x18,3,0,0,0,1,2,3]);
+  const bytes=Buffer.concat([a,b]),d=digest(bytes);
+  const encoded=Buffer.concat([skip,compressed(a),compressed(b),skip]);
+  assert.equal((await request(path('blobs',d),'PUT',streaming(encoded,1),{'if-none-match':'*','content-encoding':'zstd'})).status,201);
+});
+
+test('corrupt, truncated, oversized-window and expanding zstd uploads never publish', async () => {
+  const bytes=Buffer.from('zstd-invalid-input-target'),d=digest(bytes),url=path('blobs',d);
+  const encoded=compressed(bytes);
+  const badChecksum=Buffer.from(encoded);badChecksum[badChecksum.length-1]^=0xff;
+  for(const bad of [encoded.subarray(0,encoded.length-1),badChecksum,Buffer.concat([encoded,Buffer.from('junk')]),
+    Buffer.from([0x28,0xb5,0x2f,0xfd,0,0xf8])]) {
+    const response=await request(url,'PUT',streaming(bad,2),{'if-none-match':'*','content-encoding':'zstd'});
+    assert.equal(response.status,400,await response.clone().text());
+    assert.equal((await request(url)).status,404);
+  }
+  const bomb=await request(url,'PUT',compressed(Buffer.alloc(3*1024*1024)),{'if-none-match':'*','content-encoding':'zstd'});
+  assert.equal(bomb.status,413,await bomb.clone().text());
+  assert.equal((await request(url)).status,404);
+});
+
+test('zstd blob packs decode incrementally and preserve per-frame verification', async () => {
+  const bytes=Buffer.from('compressed-pack-member');
+  const entries=[[digest(bytes),bytes],[digest(''),Buffer.alloc(0)]];
+  const response=await request('/v1/blobs:pack-upload','POST',streaming(compressed(pack(entries)),2),{...packHeaders(entries),'content-encoding':'zstd'});
+  assert.equal(response.status,200,await response.clone().text());
+  assert.equal((await request(path('blobs',entries[0][0]))).status,200);
+  const corrupt=[[digest('bad-compressed-member'),Buffer.from('wrong-compressed-data')]];
+  const bad=await request('/v1/blobs:pack-upload','POST',compressed(pack(corrupt)),{...packHeaders(corrupt),'content-encoding':'zstd'});
+  assert.ok([400,413].includes(bad.status));
+  assert.equal((await request(path('blobs',corrupt[0][0]))).status,404);
+});
+
+test('OIDC discovers and caches keys across concurrent requests and supports RSA, EC and Ed25519', async () => {
+  const d=digest('oidc-missing'),url=path('blobs',d);
+  const token=jwt();
+  const statuses=await Promise.all(Array.from({length:4},async()=> (await request(url,'GET',undefined,{authorization:`Bearer ${token}`})).status));
+  assert.deepEqual(statuses,[404,404,404,404]);
+  assert.equal(outboundCounts.get('https://issuer.test/.well-known/openid-configuration'),1);
+  assert.equal(outboundCounts.get('https://issuer.test/keys'),1);
+  for(const [algorithm,kid,key] of [['ES256','ec-key',ecKeys.privateKey],['ES384','ec384-key',ec384Keys.privateKey],['EdDSA','ed-key',edKeys.privateKey],
+    ...['RS384','RS512','PS256','PS384','PS512'].map(alg=>[alg,`${alg}-key`,oidcKeys.privateKey])]) {
+    assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${jwt({}, {algorithm,kid,key})}`})).status,404);
+  }
+  const bytes=Buffer.from('oidc-upload'),upload=await request(path('blobs',digest(bytes)),'PUT',bytes,{'if-none-match':'*',authorization:`Bearer ${token}`});
+  assert.equal(upload.status,201,await upload.clone().text());
+});
+
+test('OIDC verifies signatures, issuer, audience, expiry, subject, not-before and JWK constraints', async () => {
+  const now=Math.floor(Date.now()/1000),url=path('blobs',digest('oidc-invalid'));
+  const invalid=[jwt({aud:'wrong'}),jwt({iss:'https://untrusted.test'}),jwt({exp:now-300}),jwt({nbf:now+300}),
+    jwt({sub:undefined}),jwt({exp:undefined}),jwt({aud:undefined}),jwt({}, {algorithm:'HS256'}),
+    jwt({}, {key:rotatedKeys.privateKey}),jwt({}, {kid:'bad-use'}),jwt({}, {kid:'bad-alg'}),jwt({}, {kid:'bad-ops'}),
+    jwt({}, {header:{crit:['custom']}})];
+  for(const token of invalid) {
+    const response=await request(url,'GET',undefined,{authorization:`Bearer ${token}`});
+    assert.equal(response.status,401,await response.clone().text());
+  }
+  const valid=jwt({aud:['another-audience','https://cache.example']});
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${valid}`})).status,404);
+});
+
+test('OIDC claim grants keep pull requests read-only and require exact claim types', async () => {
+  const bytes=Buffer.from('oidc-pr-output'),url=path('blobs',digest(bytes));
+  const pr=jwt({event_name:'pull_request'});
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${pr}`})).status,404);
+  assert.equal((await request(url,'PUT',bytes,{'if-none-match':'*',authorization:`Bearer ${pr}`})).status,403);
+  for(const claims of [{repository_owner_id:123},{repository_owner_id:'wrong'},{repository:'another/project'}]) {
+    assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${jwt(claims)}`})).status,403);
+  }
+  const grouped=jwt({repository:undefined,groups:['other','build'],trusted:true,level:2});
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${grouped}`})).status,404);
+  assert.equal((await request(url,'PUT',bytes,{'if-none-match':'*',authorization:`Bearer ${grouped}`})).status,403);
+});
+
+test('OIDC explicit JWKS skips discovery; mismatched discovery issuers fail closed', async () => {
+  const url=path('blobs',digest('oidc-direct'));
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${jwt({iss:'https://direct.test'})}`})).status,404);
+  assert.equal(outboundCounts.get('https://direct.test/.well-known/openid-configuration'),undefined);
+  assert.equal(outboundCounts.get('https://direct.test/keys'),1);
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${jwt({iss:'https://mismatch.test'})}`})).status,401);
+  assert.equal(outboundCounts.get('https://mismatch.test/keys'),undefined);
+});
+
+test('OIDC throttles unknown kids, rotates keys, and retains known keys on refresh failure', {timeout:40_000}, async () => {
+  const url=path('blobs',digest('oidc-rotation'));
+  const fallback=jwt({iss:'https://fallback.test'});
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${fallback}`})).status,404);
+  const before=outboundCounts.get('https://issuer.test/keys');
+  for(let i=0;i<4;i++) {
+    const unknown=jwt({}, {kid:`unknown-${i}`});
+    assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${unknown}`})).status,401);
+  }
+  assert.equal(outboundCounts.get('https://issuer.test/keys'),before);
+  await delay(31_000);
+  failFallback=true;
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${fallback}`})).status,404);
+  rotated=true;
+  const token=jwt({}, {kid:'rotated-key',key:rotatedKeys.privateKey});
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${token}`})).status,404);
+  assert.equal(outboundCounts.get('https://issuer.test/keys'),before+1);
+  assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${jwt()}`})).status,401);
+});
+
+test('OIDC rejects empty claim rules, empty audiences, duplicate issuers and symmetric-only configuration', async () => {
+  const base=providers[0];
+  for(const configs of [
+    [{...base,rules:[{claims:{},read:['*'],write:['*']}]}],
+    [{...base,audiences:[]}], [base,base], [{...base,algorithms:['HS256']}],
+  ]) {
+    const fixture=runtime({MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify(configs)});
+    try {
+      const response=await fixture.dispatchFetch(`https://cache.example${path('blobs',digest('config'))}`,{
+        headers:{'mbx-cache-protocol':'1','mbx-cache-namespace':'test/project',authorization:`Bearer ${jwt()}`},
+      });
+      assert.equal(response.status,500,await response.clone().text());
+    } finally {await fixture.dispose();}
+  }
+});
+
+test('encoded-byte limits also bound zstd skippable frames that produce no output', async () => {
+  const fixture=runtime({MBX_CACHE_MAX_BLOB_BYTES:'1024'});
+  try {
+    const header=Buffer.from([0x50,0x2a,0x4d,0x18,0,8,0,0]);
+    const response=await fixture.dispatchFetch(`https://cache.example${path('blobs',digest(''))}`,{
+      method:'PUT',body:Buffer.concat([header,Buffer.alloc(2048)]),
+      headers:{'mbx-cache-protocol':'1','mbx-cache-namespace':'test/project',authorization:'Bearer test-token',
+        'if-none-match':'*','content-encoding':'zstd'},
+    });
+    assert.equal(response.status,413,await response.clone().text());
+    assert.equal((await (await fixture.getR2Bucket('MBX_BLOBS')).list()).objects.length,0);
+  } finally {await fixture.dispose();}
 });

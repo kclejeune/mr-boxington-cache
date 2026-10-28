@@ -1,9 +1,13 @@
 mod auth;
+#[path = "../../src/auth_policy.rs"]
+mod auth_policy;
+mod compression;
 mod error;
 mod maintenance;
 mod metadata;
 #[path = "../../src/model.rs"]
 mod model;
+mod oidc;
 mod upload;
 #[path = "../../src/validation.rs"]
 mod validation;
@@ -63,7 +67,7 @@ async fn handle(request: &mut Request, env: &Env) -> Result<Response> {
         return capabilities(max_blob_bytes);
     }
     let write = method == Method::Put || path == "/v1/blobs:pack-upload";
-    let namespace = auth::authorize(env, request.headers(), write)?;
+    let namespace = auth::authorize(env, request.headers(), write).await?;
     let store = Store {
         db: env.d1("MBX_DB")?.with_session(Some("first-primary"))?,
         bucket: env.bucket("MBX_BLOBS")?,
@@ -152,8 +156,12 @@ async fn resource(
         }
         (Method::Put, "blobs") => {
             immutable(request)?;
-            identity(request)?;
-            let created = upload::upload(store, namespace, &digest, request.stream()?).await?;
+            let stream = compression::body(
+                request,
+                store.max_blob_bytes,
+                digest.size.min(store.max_blob_bytes),
+            )?;
+            let created = upload::upload(store, namespace, &digest, stream).await?;
             empty(if created { 201 } else { 204 })
         }
         (Method::Get, "action-results") => {
@@ -215,7 +223,7 @@ async fn resource(
 fn capabilities(max_blob_bytes: u64) -> Result<Response> {
     let mut c = Capabilities::new(CapabilityProtocol::new(PROTOCOL_VERSION, 0));
     c.digest_algorithms = vec!["blake3".into(), "sha256".into()];
-    c.compressors = vec!["identity".into()];
+    c.compressors = vec!["identity".into(), "zstd".into()];
     c.action_kinds = BTreeMap::from([
         ("task".into(), ActionKindCapability::new(1, 1)),
         ("rustc".into(), ActionKindCapability::new(1, 1)),
@@ -426,12 +434,12 @@ async fn download_pack(request: &mut Request, store: &Store, namespace: &str) ->
 
 // Read a pack without buffering a complete frame or the complete request.
 struct Input {
-    stream: worker::ByteStream,
+    stream: compression::BodyStream,
     pending: Vec<u8>,
     offset: usize,
 }
 impl Input {
-    async fn take(&mut self, max: usize) -> worker::Result<Option<Vec<u8>>> {
+    async fn take(&mut self, max: usize) -> Result<Option<Vec<u8>>> {
         while self.offset == self.pending.len() {
             match self.stream.next().await {
                 Some(chunk) => {
@@ -459,7 +467,6 @@ impl Input {
     }
 }
 async fn upload_pack(request: &mut Request, store: &Store, namespace: &str) -> Result<Response> {
-    identity(request)?;
     if request.headers().get("content-type")?.as_deref() != Some(BLOB_PACK_MEDIA_TYPE) {
         return Err(Error::new(415, "invalid blob pack content type"));
     }
@@ -469,7 +476,11 @@ async fn upload_pack(request: &mut Request, store: &Store, namespace: &str) -> R
         return Err(Error::new(413, "pack exceeds configured limit"));
     }
     let mut input = Input {
-        stream: request.stream()?,
+        stream: compression::body(
+            request,
+            store.max_blob_bytes + 8 + 41 * WORKER_BATCH_LIMIT as u64,
+            declared + 8 + 41 * count,
+        )?,
         pending: Vec::new(),
         offset: 0,
     };
@@ -502,7 +513,7 @@ async fn upload_pack(request: &mut Request, store: &Store, namespace: &str) -> R
             let mut remaining=size;
             while remaining>0 {
                 let chunk=input_ref.take(remaining.min(64*1024) as usize).await?
-                    .ok_or_else(|| worker::Error::from("truncated blob pack"))?;
+                    .ok_or_else(|| Error::new(400,"truncated blob pack"))?;
                 remaining-=chunk.len() as u64; yield chunk;
             }
         };

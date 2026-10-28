@@ -1,4 +1,5 @@
 mod auth;
+mod auth_policy;
 mod config;
 mod metadata;
 mod metrics;

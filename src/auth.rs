@@ -1,92 +1,21 @@
+pub use crate::auth_policy::Access;
+use crate::auth_policy::*;
+const INITIAL_FETCH_BACKOFF_MILLIS: u64 = 250;
+const INITIAL_FETCH_ATTEMPTS: u32 = 3;
+const MIN_JWKS_REFRESH_SECONDS: u64 = 30;
 use std::{
-    collections::BTreeMap,
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use axum::http::HeaderMap;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{
-    Algorithm, DecodingKey, Validation, decode, decode_header,
-    jwk::{JwkSet, KeyOperations, PublicKeyUse},
-};
+use jsonwebtoken::{Algorithm, decode_header, jwk::JwkSet};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::server::ApiError;
-
-const DEFAULT_JWKS_REFRESH_SECONDS: u64 = 300;
-const DEFAULT_CLOCK_SKEW_SECONDS: u64 = 60;
-const MIN_JWKS_REFRESH_SECONDS: u64 = 30;
-const INITIAL_FETCH_ATTEMPTS: u32 = 3;
-const INITIAL_FETCH_BACKOFF_MILLIS: u64 = 250;
-const DEFAULT_ALGORITHMS: &[Algorithm] = &[
-    Algorithm::RS256,
-    Algorithm::RS384,
-    Algorithm::RS512,
-    Algorithm::PS256,
-    Algorithm::PS384,
-    Algorithm::PS512,
-    Algorithm::ES256,
-    Algorithm::ES384,
-    Algorithm::EdDSA,
-];
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TokenGrant {
-    pub token: String,
-    #[serde(default)]
-    pub read: Vec<String>,
-    #[serde(default)]
-    pub write: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OidcProviderConfig {
-    issuer: String,
-    audiences: Vec<String>,
-    #[serde(default)]
-    discovery_uri: Option<String>,
-    #[serde(default)]
-    jwks_uri: Option<String>,
-    #[serde(default)]
-    algorithms: Vec<String>,
-    #[serde(default = "default_jwks_refresh_seconds")]
-    jwks_refresh_seconds: u64,
-    #[serde(default = "default_clock_skew_seconds")]
-    clock_skew_seconds: u64,
-    rules: Vec<OidcRule>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OidcRule {
-    claims: BTreeMap<String, ClaimRequirement>,
-    #[serde(default)]
-    read: Vec<String>,
-    #[serde(default)]
-    write: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-enum ClaimRequirement {
-    One(ScalarValue),
-    Any(Vec<ScalarValue>),
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(untagged)]
-enum ScalarValue {
-    String(String),
-    Number(serde_json::Number),
-    Bool(bool),
-}
 
 #[derive(Debug, Deserialize)]
 struct DiscoveryDocument {
@@ -119,12 +48,6 @@ pub struct Authorizer {
     oidc: Vec<OidcProvider>,
     allow_anonymous: bool,
     anonymous_read_namespaces: Vec<String>,
-}
-
-#[derive(Clone, Copy)]
-pub enum Access {
-    Read,
-    Write,
 }
 
 impl Authorizer {
@@ -274,39 +197,15 @@ impl OidcProvider {
             }
             tracing::warn!(%error, issuer = self.config.issuer, "using stale OIDC keys after refresh failed");
         }
-        let key = {
-            let keys = self.keys.read().await;
-            let jwk = keys
-                .set
-                .find(kid)
-                .context("JWT signing key was not found")?;
-            if jwk.common.key_algorithm.is_some_and(|algorithm| {
-                Algorithm::from_str(&algorithm.to_string()).ok() != Some(header.alg)
-            }) || jwk
-                .common
-                .public_key_use
-                .as_ref()
-                .is_some_and(|usage| usage != &PublicKeyUse::Signature)
-                || jwk
-                    .common
-                    .key_operations
-                    .as_ref()
-                    .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
-            {
-                bail!("JWT signing key is not valid for this algorithm");
-            }
-            DecodingKey::from_jwk(jwk).context("decode JWT signing key")?
-        };
-
-        let mut validation = Validation::new(header.alg);
-        validation.set_audience(&self.config.audiences);
-        validation.set_issuer(&[&self.config.issuer]);
-        validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
-        validation.validate_nbf = true;
-        validation.leeway = self.config.clock_skew_seconds;
-        Ok(decode::<Value>(token, &key, &validation)
-            .context("validate JWT")?
-            .claims)
+        let jwk = self
+            .keys
+            .read()
+            .await
+            .set
+            .find(kid)
+            .cloned()
+            .context("JWT signing key was not found")?;
+        verify_jwt(token, &jwk, header.alg, &self.config)
     }
 
     async fn refresh_keys(&self, kid: &str) -> anyhow::Result<()> {
@@ -332,49 +231,6 @@ impl OidcProvider {
     }
 }
 
-impl OidcRule {
-    fn patterns(&self, access: Access) -> &[String] {
-        match access {
-            Access::Read => &self.read,
-            Access::Write => &self.write,
-        }
-    }
-
-    fn matches_claims(&self, claims: &Value) -> bool {
-        self.claims.iter().all(|(name, requirement)| {
-            claims
-                .get(name)
-                .is_some_and(|actual| requirement.matches(actual))
-        })
-    }
-}
-
-impl ClaimRequirement {
-    fn matches(&self, actual: &Value) -> bool {
-        let expected = match self {
-            Self::One(value) => std::slice::from_ref(value),
-            Self::Any(values) => values,
-        };
-        match actual {
-            Value::Array(values) => values
-                .iter()
-                .any(|actual| expected.iter().any(|value| value.matches(actual))),
-            actual => expected.iter().any(|value| value.matches(actual)),
-        }
-    }
-}
-
-impl ScalarValue {
-    fn matches(&self, actual: &Value) -> bool {
-        match (self, actual) {
-            (Self::String(expected), Value::String(actual)) => expected == actual,
-            (Self::Number(expected), Value::Number(actual)) => expected == actual,
-            (Self::Bool(expected), Value::Bool(actual)) => expected == actual,
-            _ => false,
-        }
-    }
-}
-
 fn parse_json_array<T: for<'de> Deserialize<'de>>(
     json: Option<&str>,
     label: &str,
@@ -383,48 +239,6 @@ fn parse_json_array<T: for<'de> Deserialize<'de>>(
         .transpose()
         .with_context(|| format!("parse {label} JSON"))
         .map(Option::unwrap_or_default)
-}
-
-fn validate_provider_config(config: &OidcProviderConfig) -> anyhow::Result<()> {
-    if config.issuer.is_empty() || config.audiences.is_empty() || config.rules.is_empty() {
-        bail!("each OIDC provider requires issuer, audiences, and rules");
-    }
-    if config.jwks_refresh_seconds == 0 {
-        bail!("OIDC jwks_refresh_seconds must be greater than zero");
-    }
-    if config.rules.iter().any(|rule| rule.claims.is_empty()) {
-        bail!("each OIDC authorization rule must require at least one claim");
-    }
-    Ok(())
-}
-
-fn configured_algorithms(
-    configured: &[String],
-    advertised: &[String],
-) -> anyhow::Result<Vec<Algorithm>> {
-    let mut algorithms = if configured.is_empty() {
-        DEFAULT_ALGORITHMS.to_vec()
-    } else {
-        configured
-            .iter()
-            .map(|name| {
-                Algorithm::from_str(name)
-                    .map_err(|_| anyhow!("unsupported OIDC algorithm {name:?}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-    };
-    algorithms.retain(|algorithm| DEFAULT_ALGORITHMS.contains(algorithm));
-    if !advertised.is_empty() {
-        let advertised = advertised
-            .iter()
-            .filter_map(|name| Algorithm::from_str(name).ok())
-            .collect::<Vec<_>>();
-        algorithms.retain(|algorithm| advertised.contains(algorithm));
-    }
-    if algorithms.is_empty() {
-        bail!("OIDC provider has no mutually supported asymmetric signing algorithm");
-    }
-    Ok(algorithms)
 }
 
 async fn fetch_initial_provider_data(
@@ -508,22 +322,6 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
         .await?)
 }
 
-fn unverified_issuer(token: &str) -> anyhow::Result<String> {
-    let mut parts = token.split('.');
-    let _header = parts.next().context("JWT is missing header")?;
-    let payload = parts.next().context("JWT is missing payload")?;
-    let _signature = parts.next().context("JWT is missing signature")?;
-    if parts.next().is_some() {
-        bail!("JWT has too many segments");
-    }
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
-    claims
-        .get("iss")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .context("JWT is missing issuer")
-}
-
 fn patterns(grant: &TokenGrant, access: Access) -> &[String] {
     match access {
         Access::Read => &grant.read,
@@ -544,49 +342,13 @@ fn authorize_patterns(patterns: &[String], namespace: &str) -> Result<String, Ap
     }
 }
 
-const fn default_jwks_refresh_seconds() -> u64 {
-    DEFAULT_JWKS_REFRESH_SECONDS
-}
-
-const fn default_clock_skew_seconds() -> u64 {
-    DEFAULT_CLOCK_SKEW_SECONDS
-}
-
-fn valid_namespace(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
-        && value
-            .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
-}
-
-fn matches_namespace(pattern: &str, namespace: &str) -> bool {
-    pattern == "*"
-        || pattern == namespace
-        || pattern.strip_suffix("/*").is_some_and(|prefix| {
-            namespace.starts_with(prefix) && namespace.as_bytes().get(prefix.len()) == Some(&b'/')
-        })
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
         Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get,
     };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, encode};
     use rsa::{
         RsaPrivateKey, RsaPublicKey,

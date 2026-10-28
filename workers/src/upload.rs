@@ -20,7 +20,7 @@ pub fn unique_key(prefix: &str) -> String {
 
 pub async fn upload<S>(store: &Store, namespace: &str, digest: &Digest, input: S) -> Result<bool>
 where
-    S: Stream<Item = worker::Result<Vec<u8>>>,
+    S: Stream<Item = Result<Vec<u8>>>,
 {
     if digest.size > store.max_blob_bytes {
         return Err(Error::new(413, "blob exceeds configured limit"));
@@ -38,7 +38,7 @@ where
             let mut blake3 = blake3::Hasher::new();
             let mut sha256 = sha2::Sha256::new();
             while let Some(chunk) = input.next().await {
-                let chunk = chunk.map_err(|e| Error::new(400, e))?;
+                let chunk = chunk?;
                 count = count
                     .checked_add(chunk.len() as u64)
                     .ok_or_else(|| Error::new(413, "blob too large"))?;

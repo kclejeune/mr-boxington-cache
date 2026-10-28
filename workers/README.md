@@ -4,6 +4,8 @@ A Rust/WASM entrypoint for the mbx v1 cache protocol, backed by a private R2
 bucket and D1. The native server remains independently buildable. Both targets
 use `mbx-cache-protocol` and `src/model.rs` / `src/validation.rs` for action
 schemas, canonical object validation, output trees, and diagnostic references.
+They also share `src/auth_policy.rs` for grant rules and JWT validation; the
+Worker uses the pure-Rust cryptography backend compiled to WASM.
 
 ## Local development
 
@@ -84,11 +86,16 @@ D1 query capacity, and the configured CPU budget.
   namespace membership independent of globally deduplicated blob content.
 - Streaming individual uploads and downloads, missing queries, upload/download
   blob packs, immutable action results, action batches, and manifest ETag CAS.
-- Static bearer grants (`MBX_CACHE_TOKENS_JSON`) and optional public read grants
+- Static bearer grants (`MBX_CACHE_TOKENS_JSON`), OIDC providers
+  (`MBX_CACHE_OIDC_PROVIDERS_JSON`), and optional public read grants
   (`MBX_CACHE_ANONYMOUS_READ_NAMESPACES_JSON`); no anonymous writes.
-- Identity request encoding. Clients negotiate this through capabilities and
-  send uncompressed uploads. Zstd and OIDC are not implemented in this target.
-  Do not copy native OIDC configuration expecting it to authorize requests.
+- Identity and zstd uploads for individual blobs and blob packs, negotiated
+  through capabilities. Zstd decoding uses pure Rust with a maximum 8 MiB
+  history window, one block at a time. Concatenated and skippable frames are
+  supported, with at most 1024 frames per request. Both encoded and decoded
+  byte limits are enforced; invalid checksums, truncated frames, excessive
+  windows, and trailing garbage are rejected. R2 stores decoded bytes and
+  responses currently use identity encoding.
 - The default blob and aggregate pack payload limit is 64 MiB, configurable with
   `MBX_CACHE_MAX_BLOB_BYTES` (1 through 4,294,967,295). Keep it below the request
   limit for your Cloudflare zone, allowing for pack framing. Streaming does not
@@ -105,6 +112,56 @@ D1 query capacity, and the configured CPU budget.
 - `/v1/status` and `/v1/capabilities` are public. Workers observability records
   invocations and internal failures; the native `/metrics` endpoint is not
   implemented in this target.
+
+## CI authentication with OIDC
+
+Use the same `MBX_CACHE_OIDC_PROVIDERS_JSON` provider configuration as the
+native server. For example, configure it as a Worker variable or secret:
+
+```json
+[{
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audiences": ["https://cache.example.com"],
+  "rules": [
+    {
+      "claims": {"repository": "acme/project", "repository_owner_id": "123"},
+      "read": ["acme/project"],
+      "write": []
+    },
+    {
+      "claims": {
+        "repository": "acme/project",
+        "repository_owner_id": "123",
+        "event_name": "push",
+        "ref_type": "branch",
+        "ref": "refs/heads/main"
+      },
+      "read": ["acme/project"],
+      "write": ["acme/project"]
+    }
+  ]
+}]
+```
+
+Set `MBX_REMOTE_OIDC_AUDIENCE=https://cache.example.com` for mbx in a GitHub
+Actions job with `id-token: write`. Static tokens and OIDC can coexist. Pin
+stable numeric identity claims alongside repository names, and restrict write
+grants to an exact protected branch and push event.
+
+Providers require audiences and nonempty claim-constrained rules. Optional
+`discovery_uri`, `jwks_uri`, `algorithms`, `jwks_refresh_seconds` (default 300),
+and `clock_skew_seconds` (default 60) retain the native configuration semantics.
+The Worker supports RS256/384/512, PS256/384/512, ES256/384, and EdDSA (Ed25519).
+It checks signatures, key usage/algorithm restrictions, issuer, audience, expiry,
+subject, and not-before before evaluating grants. Symmetric algorithms and
+unsupported critical JWT headers are rejected.
+
+Discovery and keys load lazily, with three initial attempts. An isolate caches
+owned Rust key data, coalesces concurrent loads, refreshes stale or unknown keys,
+and imposes a 30-second refresh cooldown. A failed refresh may retain an
+already-known key; an unknown key never authenticates that way. Fetches have a
+10-second deadline and 1 MiB response bound. Up to 16 providers, 128 keys per
+key set, and 16 KiB bearer tokens are accepted. Use HTTPS for provider endpoints.
 
 ## Upload publication and retention
 

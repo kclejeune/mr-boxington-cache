@@ -9,6 +9,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 async-stream = "0.3"
+anyhow = "1"
+base64 = "0.23"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+getrandom = { version = "0.2", features = ["js"] }
+ruzstd = "0.9"
 worker-sys = "0.8.7"
 blake3 = { version = "1", features = ["pure"] }
 futures-util = "0.3"
