@@ -158,12 +158,13 @@ the Rust entrypoint binding but does not emulate production Workers Caching.
 Verify actual edge hits after deployment with a write-enabled token:
 
 ```sh
-MBX_REMOTE_TOKEN=... python3 scripts/smoke-test.py \
+MBX_REMOTE_TOKEN=... node scripts/smoke-test.mjs \
   --url https://your-worker.workers.dev --namespace acme/project
 ```
 
-The smoke test publishes small unique SHA-256 fixtures, requires real cache
-hits, checks pack/batch reads, and checks authorization after warming the cache.
+The smoke test publishes small SHA-256/BLAKE3 fixtures and an 8 MiB zstd upload,
+requires real cache hits, checks pack/batch reads, and checks authorization after
+warming the cache. It uses the Node 24 development tools, not a Node Worker runtime.
 
 ## CI authentication with OIDC
 
