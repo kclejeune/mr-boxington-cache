@@ -97,3 +97,20 @@ pub fn setting(env: &Env, name: &str, fallback: &str) -> String {
         .or_else(|_| env.var(name).map(|value| value.to_string()))
         .unwrap_or_else(|_| fallback.to_owned())
 }
+
+/// A bucket may be shared with the native server. New writes and GC own only this prefix.
+pub fn object_prefix(env: &Env) -> Result<String> {
+    let prefix = setting(env, "MBX_CACHE_R2_PREFIX", "workers/v1")
+        .trim_matches('/')
+        .to_owned();
+    if prefix.is_empty()
+        || prefix
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(Error::internal(
+            "MBX_CACHE_R2_PREFIX must be a nonempty object prefix",
+        ));
+    }
+    Ok(prefix)
+}

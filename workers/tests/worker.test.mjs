@@ -62,10 +62,11 @@ function jwt(claims={},options={}) {
   return `${input}.${signature.toString('base64url')}`;
 }
 function runtime(bindings={}) {
-  return new Miniflare(convertV4MiniflareOptions({ workers: [{
+  const options=convertV4MiniflareOptions({ workers: [{
     name: "mbx-cache",
-    modulesRoot: `${root}build`,
+    modulesRoot: root,
     modules: [
+      {type:'ESModule',path:`${root}entry.js`},
       {type:'ESModule',path:`${root}build/index.js`},
       {type:'CompiledWasm',path:`${root}build/index_bg.wasm`},
     ],
@@ -79,10 +80,14 @@ function runtime(bindings={}) {
       ]),
       MBX_CACHE_ANONYMOUS_READ_NAMESPACES_JSON: '["public/*"]',
       MBX_CACHE_MAX_BLOB_BYTES: '67108864',
+      MBX_CACHE_CLEANUP_ENABLED:'true',
       MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify(providers),
       ...bindings,
     },
-  }] }));
+  }] });
+  options.workers[0].config.cache={enabled:true,crossVersionCache:true};
+  options.workers[0].config.exports={default:{type:'worker',cache:{enabled:false}},CachedStore:{type:'worker',cache:{enabled:true}}};
+  return new Miniflare(options);
 }
 before(async () => {
   oidcKeys=generateKeyPairSync('rsa',{modulusLength:2048});
@@ -141,7 +146,7 @@ test('capabilities advertise only supported features and encodings', async () =>
   assert.deepEqual(c.compressors,['identity','zstd']);
   assert.equal(c.features.blob_pack_uploads,true);
   assert.equal(c.features.action_promises,false);
-  assert.equal(c.limits.max_batch_items,512);
+  assert.equal(c.limits.max_batch_items,256);
 });
 
 test('requires protocol, authorization, namespace and immutable preconditions', async () => {
@@ -169,6 +174,37 @@ test('streams BLAKE3, SHA256 and empty blobs; deduplicates concurrent uploads', 
   const statuses=await Promise.all(Array.from({length:4},async()=> (await request(path('blobs',d),'PUT',bytes,{'if-none-match':'*'})).status));
   assert.equal(statuses.filter(s=>s===201).length,1);
   assert.equal(statuses.filter(s=>s===204).length,3);
+});
+
+test('internal immutable reads enforce authorization, namespace and private downstream headers', async () => {
+  const bytes=Buffer.from('isolated-edge-cache-proof'),d=await put(bytes),url=path('blobs',d);
+  const first=await request(url+'?ignored=first');
+  assert.equal(first.status,200);
+  assert.deepEqual(Buffer.from(await first.arrayBuffer()),bytes);
+  // Miniflare does not implement the production Workers Caching pipeline.
+  // A deployed smoke test separately requires a real HIT.
+  const warm=await request(url+'?ignored=second');
+  assert.equal(warm.headers.get('mbx-cache-edge-status'),'BYPASS');
+  assert.equal(warm.headers.get('cache-control'),'private, no-store');
+  assert.deepEqual(Buffer.from(await warm.arrayBuffer()),bytes);
+  const cached=await request(url);
+  assert.deepEqual(Buffer.from(await cached.arrayBuffer()),bytes);
+  assert.equal((await request(url,'GET',undefined,{authorization:'Bearer invalid'})).status,401);
+  assert.equal((await request(url,'GET',undefined,{'mbx-cache-namespace':'test/foreign'})).status,404);
+  const head=await request(url,'HEAD');
+  assert.equal(head.status,200);
+  assert.equal(head.headers.get('mbx-cache-edge-status'),'BYPASS');
+  assert.equal(head.headers.get('content-length'),String(bytes.length));
+  assert.equal((await head.arrayBuffer()).byteLength,0);
+});
+
+test('edge misses are not cached across subsequent publication', async () => {
+  const bytes=Buffer.from('edge-negative-then-publish'),d=digest(bytes),url=path('blobs',d);
+  assert.equal((await request(url)).status,404);
+  await put(bytes);
+  const found=await request(url);
+  assert.equal(found.status,200);
+  assert.deepEqual(Buffer.from(await found.arrayBuffer()),bytes);
 });
 
 test('bad hashes, sizes and unsupported encoding never gain namespace visibility', async () => {
@@ -271,7 +307,7 @@ test('batch lookups exceed the D1 placeholder limit without exposing foreign blo
   const response=await request('/v1/blobs:missing','POST',JSON.stringify({digests}));
   assert.equal(response.status,200);
   assert.deepEqual((await response.json()).missing,digests);
-  const oversized=await request('/v1/blobs:missing','POST',JSON.stringify({digests:Array.from({length:513},()=>digests[0])}));
+  const oversized=await request('/v1/blobs:missing','POST',JSON.stringify({digests:Array.from({length:257},()=>digests[0])}));
   assert.equal(oversized.status,400);
 });
 
@@ -303,7 +339,7 @@ test('D1 transaction failure cannot publish an object or namespace membership', 
 test('scheduled cleanup persists its cursor and preserves referenced objects', async () => {
   const worker=await mf.getWorker();
   await worker.scheduled({cron:'17 * * * *'});
-  const row=await db.prepare("SELECT * FROM maintenance WHERE name='orphans'").first();
+  const row=await db.prepare("SELECT * FROM maintenance WHERE name='worker-orphans-v1'").first();
   assert.ok(row);
   const d=await put('survives-maintenance');
   await worker.scheduled({cron:'17 * * * *'});
@@ -476,5 +512,44 @@ test('encoded-byte limits also bound zstd skippable frames that produce no outpu
     });
     assert.equal(response.status,413,await response.clone().text());
     assert.equal((await (await fixture.getR2Bucket('MBX_BLOBS')).list()).objects.length,0);
+  } finally {await fixture.dispose();}
+});
+
+test('new writes and orphan scans are confined to the Worker prefix in a shared bucket', async () => {
+  const keys=Array.from({length:101},(_,i)=>`mbx-cache/v1/blobs/foreign-${i}`);
+  await Promise.all(keys.map(key=>bucket.put(key,'legacy')));
+  const d=await put('worker-prefix-test');
+  const row=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(`${d.algorithm}/${d.hash}/${d.size}`).first();
+  assert.ok(row.object_key.startsWith('workers/v1/blobs/'));
+  await (await mf.getWorker()).scheduled({cron:'17 * * * *'});
+  const cursor=await db.prepare("SELECT cursor FROM maintenance WHERE name='worker-orphans-v1'").first();
+  assert.equal(cursor.cursor,null,'foreign objects must not consume the Worker cleanup page');
+  assert.equal(await (await bucket.get(keys[0])).text(),'legacy');
+});
+
+test('expired imported pointers are reported missing and repaired by verified uploads', async () => {
+  const bytes=Buffer.from('expired-native-object'),d=await put(bytes);
+  const key=`${d.algorithm}/${d.hash}/${d.size}`;
+  const old=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(key).first();
+  await bucket.delete(old.object_key);
+  await db.prepare("UPDATE blob_objects SET object_key='mbx-cache/v1/blobs/expired' WHERE blob_key=?").bind(key).run();
+  const response=await request('/v1/blobs:missing','POST',JSON.stringify({digests:[d]}));
+  assert.deepEqual((await response.json()).missing,[d]);
+  await put(bytes);
+  const repaired=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(key).first();
+  assert.ok(repaired.object_key.startsWith('workers/v1/blobs/'));
+  assert.equal(await (await request(path('blobs',d))).text(),bytes.toString());
+});
+
+test('cleanup is disabled during migration even when retention is configured', async () => {
+  const fixture=runtime({MBX_CACHE_CLEANUP_ENABLED:'false',MBX_CACHE_RETENTION_DAYS:'1'});
+  try {
+    const local=await fixture.getD1Database('MBX_DB');
+    const schema=await readFile(`${root}migrations/0001_init.sql`,'utf8');
+    for(const statement of schema.replace(/^--.*$/gm,'').split(';').filter(s=>s.trim())) await local.prepare(statement).run();
+    await local.prepare("INSERT INTO blob_objects(blob_key,object_key,created_at) VALUES ('old','legacy',0)").run();
+    await (await fixture.getWorker()).scheduled({cron:'17 * * * *'});
+    assert.equal((await local.prepare('SELECT count(*) AS n FROM blob_objects').first()).n,1);
+    assert.equal((await local.prepare('SELECT count(*) AS n FROM maintenance').first()).n,0);
   } finally {await fixture.dispose();}
 });

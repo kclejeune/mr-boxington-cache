@@ -7,6 +7,12 @@ use wasm_bindgen::JsValue;
 use worker::{D1Database, Env};
 
 pub async fn sweep(env: &Env) -> Result<()> {
+    if !auth::setting(env, "MBX_CACHE_CLEANUP_ENABLED", "false")
+        .parse::<bool>()
+        .map_err(Error::internal)?
+    {
+        return Ok(());
+    }
     let db = env.d1("MBX_DB")?;
     let days: u32 = auth::setting(env, "MBX_CACHE_RETENTION_DAYS", "0")
         .parse()
@@ -26,10 +32,11 @@ pub async fn sweep(env: &Env) -> Result<()> {
 async fn sweep_orphans(env: &Env, db: &D1Database) -> Result<()> {
     let bucket = env.bucket("MBX_BLOBS")?;
     let cursor: Option<String> = db
-        .prepare("SELECT cursor FROM maintenance WHERE name='orphans'")
+        .prepare("SELECT cursor FROM maintenance WHERE name='worker-orphans-v1'")
         .first(Some("cursor"))
         .await?;
-    let mut list = bucket.list().limit(100);
+    let prefix = format!("{}/", auth::object_prefix(env)?);
+    let mut list = bucket.list().prefix(&prefix).limit(100);
     if let Some(cursor) = cursor {
         list = list.cursor(cursor);
     }
@@ -47,7 +54,7 @@ async fn sweep_orphans(env: &Env, db: &D1Database) -> Result<()> {
         }
     }
     let cursor = objects.cursor().filter(|_| objects.truncated());
-    db.prepare("INSERT INTO maintenance(name,cursor) VALUES ('orphans',?1) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor")
+    db.prepare("INSERT INTO maintenance(name,cursor) VALUES ('worker-orphans-v1',?1) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor")
         .bind(&[cursor.map(JsValue::from).unwrap_or(JsValue::NULL)])?.run().await?;
     Ok(())
 }

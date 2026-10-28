@@ -4,3 +4,5 @@
 /.wrangler/
 /.dev.vars
 /wrangler.local.jsonc
+
+__pycache__/

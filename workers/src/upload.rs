@@ -26,7 +26,7 @@ where
         return Err(Error::new(413, "blob exceeds configured limit"));
     }
     let algorithm = digest.algorithm_kind().map_err(|e| Error::new(400, e))?;
-    let object_key = unique_key("blobs");
+    let object_key = unique_key(&format!("{}/blobs", store.object_prefix));
     // The native stream tells R2 the decoded length without buffering a blob.
     let fixed =
         worker_sys::FixedLengthStream::new(digest.size as u32).map_err(worker::Error::from)?;

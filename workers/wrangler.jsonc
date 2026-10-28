@@ -1,21 +1,58 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "mbx-cache",
-  "main": "build/index.js",
+  "main": "entry.js",
   "compatibility_date": "2026-10-28",
-  "build": { "command": "worker-build --release" },
-  "limits": { "cpu_ms": 30000 },
-  "d1_databases": [{
-    "binding": "MBX_DB",
-    "database_name": "mbx-cache",
-    "database_id": "00000000-0000-0000-0000-000000000000",
-    "migrations_dir": "migrations"
-  }],
-  "r2_buckets": [{ "binding": "MBX_BLOBS", "bucket_name": "mbx-cache" }],
-  "triggers": { "crons": ["17 * * * *"] },
+  "build": {
+    "command": "worker-build --release"
+  },
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "d1_databases": [
+    {
+      "binding": "MBX_DB",
+      "database_name": "mbx-cache",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MBX_BLOBS",
+      "bucket_name": "mbx-cache"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "17 * * * *"
+    ]
+  },
   "vars": {
     "MBX_CACHE_MAX_BLOB_BYTES": "67108864",
-    "MBX_CACHE_RETENTION_DAYS": "0"
+    "MBX_CACHE_RETENTION_DAYS": "0",
+    "MBX_CACHE_R2_PREFIX": "workers/v1",
+    "MBX_CACHE_CLEANUP_ENABLED": "false"
   },
-  "observability": { "enabled": true }
+  "observability": {
+    "enabled": true
+  },
+  "cache": {
+    "enabled": true,
+    "cross_version_cache": true
+  },
+  "exports": {
+    "default": {
+      "type": "worker",
+      "cache": {
+        "enabled": false
+      }
+    },
+    "CachedStore": {
+      "type": "worker",
+      "cache": {
+        "enabled": true
+      }
+    }
+  }
 }

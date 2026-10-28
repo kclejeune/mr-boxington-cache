@@ -177,6 +177,8 @@ jobs:
       - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
       - run: mise exec node@24 -- npm run build
       - run: mise exec node@24 -- npm test
+      - run: cargo build --manifest-path ../Cargo.toml --features migration --bin mbx-cache-migrate --locked
+      - run: mise exec node@24 -- python3 -m unittest discover -s scripts -p test_migration.py
 
   final:
     permissions: {}

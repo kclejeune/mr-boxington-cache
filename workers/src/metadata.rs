@@ -12,6 +12,7 @@ pub(crate) struct Store {
     pub db: D1DatabaseSession,
     pub bucket: Bucket,
     pub max_blob_bytes: u64,
+    pub object_prefix: String,
     pub validation_queries: std::sync::atomic::AtomicUsize,
 }
 #[derive(Deserialize)]
@@ -69,6 +70,9 @@ impl Store {
             .cloned()
             .collect())
     }
+    pub async fn visible_object(&self, namespace: &str, digest: &Digest) -> Result<Option<String>> {
+        Ok(self.statement("SELECT o.object_key FROM namespace_blobs b JOIN blob_objects o ON o.blob_key=b.blob_key WHERE b.namespace=?1 AND b.blob_key=?2",&[namespace,&digest.key()])?.first(Some("object_key")).await?)
+    }
     pub async fn object_key(&self, digest: &Digest) -> Result<Option<String>> {
         Ok(self
             .statement(
@@ -78,12 +82,53 @@ impl Store {
             .first(Some("object_key"))
             .await?)
     }
+    /// Consult storage as well as membership, so lifecycle-expired imports can be uploaded again.
+    pub async fn present_blobs(&self, namespace: &str, digests: &[Digest]) -> Result<Vec<Digest>> {
+        use futures_util::{StreamExt, stream};
+        #[derive(Deserialize)]
+        struct ObjectRow {
+            blob_key: String,
+            object_key: String,
+        }
+        let keys = serde_json::to_string(&digests.iter().map(Digest::key).collect::<Vec<_>>())?;
+        let rows=self.statement("SELECT o.blob_key,o.object_key FROM json_each(?2) r JOIN namespace_blobs b ON b.namespace=?1 AND b.blob_key=r.value JOIN blob_objects o ON o.blob_key=b.blob_key",&[namespace,&keys])?.all().await?.results::<ObjectRow>()?;
+        let found = stream::iter(rows)
+            .map(|row| async move {
+                let object = self.bucket.head(&row.object_key).await?;
+                Ok::<_, Error>(object.map(|object| (row.blob_key, object.size())))
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        let mut present = std::collections::HashMap::new();
+        for row in found {
+            if let Some((key, size)) = row? {
+                present.insert(key, size);
+            }
+        }
+        Ok(digests
+            .iter()
+            .filter(|d| present.get(&d.key()) == Some(&d.size))
+            .cloned()
+            .collect())
+    }
+
     pub async fn register(
         &self,
         namespace: &str,
         digest: &Digest,
         object_key: &str,
     ) -> Result<bool> {
+        if let Some(previous) = self.object_key(digest).await?
+            && self.bucket.head(&previous).await?.is_none()
+        {
+            let key = digest.key();
+            let results=self.db.batch(vec![
+                self.statement("UPDATE blob_objects SET object_key=?2,created_at=unixepoch() WHERE blob_key=?1 AND object_key=?3",&[&key,object_key,&previous])?,
+                self.statement("INSERT INTO namespace_blobs(namespace,blob_key) VALUES (?1,?2) ON CONFLICT DO NOTHING",&[namespace,&key])?,
+            ]).await?;
+            return Ok(results[0].meta()?.is_some_and(|m| m.changes == Some(1)));
+        }
         let key = digest.key();
         let results = self.db.batch(vec![
             self.statement("INSERT INTO blob_objects(blob_key,object_key) VALUES (?1,?2) ON CONFLICT DO NOTHING", &[&key,object_key])?,

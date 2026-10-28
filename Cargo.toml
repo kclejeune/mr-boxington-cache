@@ -18,6 +18,14 @@ include = [
   "/LICENSE",
 ]
 
+[features]
+migration = []
+
+[[bin]]
+name = "mbx-cache-migrate"
+path = "src/bin/mbx-cache-migrate.rs"
+required-features = ["migration"]
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"

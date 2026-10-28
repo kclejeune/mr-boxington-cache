@@ -2,6 +2,7 @@ mod auth;
 #[path = "../../src/auth_policy.rs"]
 mod auth_policy;
 mod compression;
+mod edge;
 mod error;
 mod maintenance;
 mod metadata;
@@ -25,27 +26,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use worker::{Context, Env, Method, Request, Response, event};
 
-const WORKER_BATCH_LIMIT: usize = 512;
+const WORKER_BATCH_LIMIT: usize = 256;
 const JSON_LIMIT: usize = 2 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_BLOB_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[event(fetch)]
-async fn fetch(mut request: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
-    match handle(&mut request, &env).await {
+async fn fetch(mut request: Request, env: Env, ctx: Context) -> worker::Result<Response> {
+    match handle(&mut request, &env, &ctx).await {
         Ok(response) => Ok(response),
-        Err(error) => {
-            let mut response = Response::from_json(&serde_json::json!({"error":error.message}))?
-                .with_status(error.status);
-            if error.status == 426 {
-                response.headers_mut().set("mbx-cache-protocol", "1")?;
-            }
-            Ok(response)
-        }
+        Err(error) => error_response(error),
     }
 }
 
-async fn handle(request: &mut Request, env: &Env) -> Result<Response> {
+async fn handle(request: &mut Request, env: &Env, ctx: &Context) -> Result<Response> {
     let path = request.path();
     let method = request.method();
     let max_blob_bytes: u64 = auth::setting(
@@ -68,17 +62,50 @@ async fn handle(request: &mut Request, env: &Env) -> Result<Response> {
     }
     let write = method == Method::Put || path == "/v1/blobs:pack-upload";
     let namespace = auth::authorize(env, request.headers(), write).await?;
-    let store = Store {
-        db: env.d1("MBX_DB")?.with_session(Some("first-primary"))?,
-        bucket: env.bucket("MBX_BLOBS")?,
-        max_blob_bytes,
-        validation_queries: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let parts: Vec<_> = path.split('/').collect();
+    if matches!(method, Method::Get | Method::Head)
+        && parts.len() == 6
+        && parts[1] == "v1"
+        && matches!(parts[2], "blobs" | "action-results")
+    {
+        let digest = parse_digest(parts[3], parts[4], parts[5], parts[2] != "blobs")?;
+        return edge::read(ctx, env, &namespace, parts[2], &digest, method).await;
+    }
+    if method == Method::Post && path == "/v1/action-results:batch" {
+        let digests = digest_list(request, true).await?;
+        let responses = futures_util::stream::iter(digests.iter())
+            .map(|digest| async {
+                let mut response =
+                    edge::read(ctx, env, &namespace, "action-results", digest, Method::Get).await?;
+                match response.status_code() {
+                    200 => Ok(Some(response.json::<ActionResult>().await?)),
+                    404 => Ok(None),
+                    _ => Err(Error::new(502, "action batch backend failed")),
+                }
+            })
+            .buffered(6)
+            .collect::<Vec<_>>()
+            .await;
+        let mut results = Vec::<ActionResult>::new();
+        for response in responses {
+            if let Some(result) = response? {
+                results.push(result);
+            }
+        }
+        return media_json(
+            &serde_json::json!({"results":results}),
+            ACTION_RESULT_BATCH_MEDIA_TYPE,
+        );
+    }
+    if method == Method::Post && path == "/v1/blobs:pack" {
+        return download_pack(request, env, ctx, &namespace, max_blob_bytes).await;
+    }
+    let store = store(env, write)?;
     match (method, path.as_str()) {
         (Method::Post, "/v1/blobs:missing") => {
             let digests = digest_list(request, false).await?;
             let visible: HashSet<_> = store
-                .visible_blobs(&namespace, &digests)
+                .present_blobs(&namespace, &digests)
                 .await?
                 .into_iter()
                 .collect();
@@ -86,15 +113,6 @@ async fn handle(request: &mut Request, env: &Env) -> Result<Response> {
                 &serde_json::json!({"missing":digests.into_iter().filter(|d| !visible.contains(d)).collect::<Vec<_>>()}),
             )
         }
-        (Method::Post, "/v1/action-results:batch") => {
-            let digests = digest_list(request, true).await?;
-            let results = store.get_results(&namespace, &digests).await?;
-            media_json(
-                &serde_json::json!({"results":results}),
-                ACTION_RESULT_BATCH_MEDIA_TYPE,
-            )
-        }
-        (Method::Post, "/v1/blobs:pack") => download_pack(request, &store, &namespace).await,
         (Method::Post, "/v1/blobs:pack-upload") => upload_pack(request, &store, &namespace).await,
         (method, _) => {
             let parts: Vec<_> = path.split('/').collect();
@@ -117,16 +135,37 @@ async fn resource(
     let action = parts[2] != "blobs";
     let digest = parse_digest(parts[3], parts[4], parts[5], action)?;
     match (method, parts[2]) {
-        (Method::Get, "blobs") => {
-            if store
-                .visible_blobs(namespace, std::slice::from_ref(&digest))
+        (Method::Head, "blobs") => {
+            let key = store
+                .visible_object(namespace, &digest)
                 .await?
-                .is_empty()
-            {
+                .ok_or_else(|| Error::new(404, "blob not found"))?;
+            let object = store
+                .bucket
+                .head(key)
+                .await?
+                .ok_or_else(|| Error::new(404, "blob not found"))?;
+            if object.size() != digest.size {
                 return Err(Error::new(404, "blob not found"));
             }
+            let mut response = Response::empty()?;
+            response
+                .headers_mut()
+                .set("content-type", "application/octet-stream")?;
+            response
+                .headers_mut()
+                .set("content-length", &digest.size.to_string())?;
+            response
+                .headers_mut()
+                .set("etag", &format!("\"{}\"", digest.hash))?;
+            response
+                .headers_mut()
+                .set("digest", &format!("{}={}", digest.algorithm, digest.hash))?;
+            Ok(response)
+        }
+        (Method::Get, "blobs") => {
             let key = store
-                .object_key(&digest)
+                .visible_object(namespace, &digest)
                 .await?
                 .ok_or_else(|| Error::new(404, "blob not found"))?;
             let object = store
@@ -164,7 +203,7 @@ async fn resource(
             let created = upload::upload(store, namespace, &digest, stream).await?;
             empty(if created { 201 } else { 204 })
         }
-        (Method::Get, "action-results") => {
+        (Method::Get | Method::Head, "action-results") => {
             let results = store.get_results(namespace, &[digest]).await?;
             let result = results
                 .first()
@@ -358,7 +397,7 @@ async fn put_manifest(
     }
     let bytes = canonical_json(&manifest).map_err(Error::internal)?;
     let etag = blake3::hash(&bytes).to_hex().to_string();
-    let object_key = upload::unique_key("manifests");
+    let object_key = upload::unique_key(&format!("{}/manifests", store.object_prefix));
     store.bucket.put(&object_key, bytes).execute().await?;
     if !store
         .commit_manifest(namespace, key, expected.as_deref(), &etag, &object_key)
@@ -376,41 +415,71 @@ async fn put_manifest(
     Ok(response)
 }
 
-async fn download_pack(request: &mut Request, store: &Store, namespace: &str) -> Result<Response> {
+async fn download_pack(
+    request: &mut Request,
+    env: &Env,
+    ctx: &Context,
+    namespace: &str,
+    max_blob_bytes: u64,
+) -> Result<Response> {
     let digests = digest_list(request, false).await?;
     let total = digests
         .iter()
         .try_fold(0u64, |n, d| n.checked_add(d.size))
         .ok_or_else(|| Error::new(413, "pack too large"))?;
-    if total > store.max_blob_bytes {
+    if total > max_blob_bytes {
         return Err(Error::new(413, "pack exceeds configured limit"));
     }
-    let visible = store.visible_blobs(namespace, &digests).await?;
+    let responses = futures_util::stream::iter(digests.iter())
+        .map(|digest| async move {
+            Ok::<_, Error>((
+                digest.clone(),
+                edge::read(ctx, env, namespace, "blobs", digest, Method::Head).await?,
+            ))
+        })
+        .buffered(6)
+        .collect::<Vec<_>>()
+        .await;
     let mut objects = Vec::new();
     let mut bytes = 0u64;
-    // Do not hold open R2 bodies for every member: only retain keys here.
-    for digest in visible {
-        if let Some(key) = store.object_key(&digest).await?
-            && store.bucket.head(&key).await?.is_some()
-        {
-            bytes += digest.size;
-            objects.push((digest, key));
+    for response in responses {
+        let (digest, response) = response?;
+        match response.status_code() {
+            200 => {
+                if response.headers().get("content-length")?.as_deref()
+                    != Some(&digest.size.to_string())
+                {
+                    return Err(Error::new(502, "pack member length mismatch"));
+                }
+                bytes += digest.size;
+                objects.push(digest);
+            }
+            404 => {}
+            _ => return Err(Error::new(502, "blob pack backend failed")),
         }
     }
     let count = objects.len();
     let length = 8 + count as u64 * 41 + bytes;
-    let bucket = store.bucket.clone();
+    let env = env.clone();
+    let raw_ctx: &wasm_bindgen::JsValue = ctx.as_ref().as_ref();
+    let ctx = Context::new(wasm_bindgen::JsCast::unchecked_into(raw_ctx.clone()));
+    let namespace = namespace.to_owned();
     let stream = async_stream::try_stream! {
         yield BLOB_PACK_MAGIC.to_vec();
-        for (digest,key) in objects {
-            let object=bucket.get(key).execute().await?.ok_or_else(|| worker::Error::from("pack member disappeared"))?;
-            if object.size()!=digest.size { Err(worker::Error::from("pack member size mismatch"))?; }
+        // Fetch and consume one body at a time. Holding every GET open while
+        // collecting headers can exhaust the platform's connection budget.
+        for digest in objects {
+            let mut response = edge::read(&ctx, &env, &namespace, "blobs", &digest, Method::Get).await
+                .map_err(|error| worker::Error::from(error.message))?;
+            if response.status_code() != 200 || response.headers().get("content-length")?.as_deref() != Some(&digest.size.to_string()) {
+                Err(worker::Error::from("pack member disappeared or changed size"))?;
+            }
             let mut header=Vec::with_capacity(41);
             header.push(if digest.algorithm=="blake3"{1}else{2});
             header.extend(hex::decode(&digest.hash).map_err(|e| worker::Error::from(e.to_string()))?);
             header.extend(digest.size.to_be_bytes());
             yield header;
-            let mut body=object.body().ok_or_else(|| worker::Error::from("missing pack member body"))?.stream()?;
+            let mut body=response.stream()?;
             while let Some(chunk)=body.next().await {yield chunk?;}
         }
     };
@@ -544,4 +613,82 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             worker::console_error!("metadata sweep failed: {}", error.message);
         }
     });
+}
+
+fn store(env: &Env, primary: bool) -> Result<Store> {
+    Ok(Store {
+        db: env.d1("MBX_DB")?.with_session(Some(if primary {
+            "first-primary"
+        } else {
+            "first-unconstrained"
+        }))?,
+        bucket: env.bucket("MBX_BLOBS")?,
+        max_blob_bytes: auth::setting(
+            env,
+            "MBX_CACHE_MAX_BLOB_BYTES",
+            &DEFAULT_BLOB_LIMIT.to_string(),
+        )
+        .parse()
+        .map_err(Error::internal)?,
+        object_prefix: auth::object_prefix(env)?,
+        validation_queries: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+fn error_response(error: Error) -> worker::Result<Response> {
+    let mut response =
+        Response::from_json(&serde_json::json!({"error":error.message}))?.with_status(error.status);
+    response.headers_mut().set("cache-control", "no-store")?;
+    if error.status == 426 {
+        response.headers_mut().set("mbx-cache-protocol", "1")?;
+    }
+    Ok(response)
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn cached_read(
+    raw: web_sys::Request,
+    env: Env,
+    raw_ctx: worker_sys::Context,
+) -> std::result::Result<web_sys::Response, wasm_bindgen::JsValue> {
+    let mut request = Request::from(raw);
+    let ctx = Context::new(raw_ctx);
+    let response: Result<Response> = async {
+        let scope: edge::Scope = ctx.props()?;
+        if !auth_policy::valid_namespace(&scope.namespace) {
+            return Err(Error::new(401, "invalid cache scope"));
+        }
+        let path = request.path();
+        let parts: Vec<_> = path.split('/').collect();
+        if !matches!(request.method(), Method::Get | Method::Head)
+            || parts.len() != 6
+            || parts[1] != "v1"
+            || !matches!(parts[2], "blobs" | "action-results")
+        {
+            return Err(Error::new(404, "not found"));
+        }
+        worker::console_log!("mbx.cache_miss kind={}", parts[2]);
+        let method = request.method();
+        let mut response = resource(
+            &mut request,
+            &store(&env, false)?,
+            &scope.namespace,
+            method,
+            &parts,
+        )
+        .await?;
+        response.headers_mut().set(
+            "cache-control",
+            if parts[2] == "blobs" {
+                "public, max-age=86400"
+            } else {
+                "public, max-age=3600"
+            },
+        )?;
+        Ok(response)
+    }
+    .await;
+    match response {
+        Ok(response) => Ok(response.into()),
+        Err(error) => error_response(error).map(Into::into).map_err(Into::into),
+    }
 }
