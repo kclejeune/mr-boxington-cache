@@ -33,10 +33,16 @@ const DEFAULT_BLOB_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[event(fetch)]
 async fn fetch(mut request: Request, env: Env, ctx: Context) -> worker::Result<Response> {
-    match handle(&mut request, &env, &ctx).await {
-        Ok(response) => Ok(response),
-        Err(error) => error_response(error),
-    }
+    let mut response = match handle(&mut request, &env, &ctx).await {
+        Ok(response) => response,
+        Err(error) => error_response(error)?,
+    };
+    // Every external response varies with authorization and/or namespace. Only
+    // the internal immutable entrypoint may opt into shared caching.
+    response
+        .headers_mut()
+        .set("cache-control", "private, no-store")?;
+    Ok(response)
 }
 
 async fn handle(request: &mut Request, env: &Env, ctx: &Context) -> Result<Response> {

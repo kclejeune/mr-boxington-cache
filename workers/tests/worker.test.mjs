@@ -273,6 +273,7 @@ test('manifest updates use atomic ETag preconditions and canonical R2 bodies', a
   const etag=created.headers.get('etag');
   const response=await request(url);
   assert.equal(response.headers.get('etag'),etag);
+  assert.equal(response.headers.get('cache-control'),'private, no-store');
   assert.equal(await response.text(),encode(manifest).toString());
   assert.equal((await request(url,'PUT',JSON.stringify(manifest),{'if-none-match':'*'})).status,412);
   assert.equal((await request(url,'PUT',JSON.stringify(manifest),{'if-match':`"${'0'.repeat(64)}"`})).status,412);
