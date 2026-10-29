@@ -154,11 +154,7 @@ async fn get_keys(
                 Err(_) if attempt + 1 < attempts => {
                     Delay::from(Duration::from_millis(250 * (attempt + 1))).await
                 }
-                Err(error) => worker::console_warn!(
-                    "OIDC key refresh failed for {}: {}",
-                    config.issuer,
-                    error.message
-                ),
+                Err(_) => worker::console_warn!("mbx.auth outcome=key_refresh_failed"),
             }
         }
         return if known {
@@ -181,7 +177,7 @@ async fn fetch_keys(
                 config.issuer.trim_end_matches('/')
             )
         });
-        let document: Discovery = fetch_json(&uri).await?;
+        let document: Discovery = fetch_json(&uri, config.allow_insecure_loopback).await?;
         if document.issuer != config.issuer {
             return Err(Error::new(401, "OIDC discovery issuer mismatch"));
         }
@@ -190,19 +186,52 @@ async fn fetch_keys(
             document.id_token_signing_alg_values_supported,
         )
     };
-    let set: JwkSet = fetch_json(&uri).await?;
+    let set: JwkSet = fetch_json(&uri, config.allow_insecure_loopback).await?;
     if set.keys.len() > 128 {
         return Err(Error::new(401, "OIDC key set is too large"));
     }
     Ok((uri, advertised, set))
 }
-async fn fetch_json<T: for<'a> Deserialize<'a>>(uri: &str) -> Result<T> {
+async fn fetch_json<T: for<'a> Deserialize<'a>>(
+    uri: &str,
+    allow_insecure_loopback: bool,
+) -> Result<T> {
     use futures_util::StreamExt;
     let controller = worker::AbortController::default();
     let signal = controller.signal();
     let read = async {
-        let url = uri.parse().map_err(Error::internal)?;
-        let mut response = Fetch::Url(url).send_with_signal(&signal).await?;
+        let mut url = url::Url::parse(uri).map_err(|_| unauthorized())?;
+        let mut hops = 0;
+        let mut response = loop {
+            crate::auth_policy::validate_endpoint(url.as_str(), allow_insecure_loopback)
+                .map_err(|_| unauthorized())?;
+            let mut init = worker::RequestInit::new();
+            init.with_redirect(worker::RequestRedirect::Manual);
+            let request = worker::Request::new_with_init(url.as_str(), &init)?;
+            let response = Fetch::Request(request).send_with_signal(&signal).await?;
+            if !matches!(response.status_code(), 301 | 302 | 303 | 307 | 308) {
+                break response;
+            }
+            if hops >= 3 {
+                return Err(unauthorized());
+            }
+            let target = response
+                .headers()
+                .get("location")?
+                .ok_or_else(unauthorized)?;
+            // Release every intermediate body before opening the next connection.
+            let raw: web_sys::Response = response.into();
+            if let Some(body) = raw.body() {
+                let _ = wasm_bindgen_futures::JsFuture::from(body.cancel()).await;
+            }
+            let next = url.join(&target).map_err(|_| unauthorized())?;
+            // Restrict redirects to the configured endpoint's origin as well as HTTPS.
+            if next.origin() != url.origin() {
+                return Err(unauthorized());
+            }
+            url = next;
+            hops += 1;
+        };
         if response.status_code() != 200 {
             return Err(Error::new(401, "OIDC endpoint returned an error"));
         }
@@ -219,13 +248,16 @@ async fn fetch_json<T: for<'a> Deserialize<'a>>(uri: &str) -> Result<T> {
     };
     let timeout = Delay::from(Duration::from_secs(10));
     futures_util::pin_mut!(read, timeout);
-    let bytes = match futures_util::future::select(read, timeout).await {
-        futures_util::future::Either::Left((result, _)) => result?,
+    let result = match futures_util::future::select(read, timeout).await {
+        futures_util::future::Either::Left((result, _)) => result,
         futures_util::future::Either::Right(_) => {
             controller.abort();
             return Err(Error::new(401, "OIDC endpoint timed out"));
         }
     };
 
+    // Abort also on size/status/redirect failures so no unread body retains a connection.
+    controller.abort();
+    let bytes = result?;
     serde_json::from_slice(&bytes).map_err(|_| Error::new(401, "invalid OIDC response"))
 }

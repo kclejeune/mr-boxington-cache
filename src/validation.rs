@@ -5,17 +5,48 @@ use crate::model::{
 };
 use std::{collections::HashSet, future::Future};
 
-pub(crate) trait ValidationStore {
+pub(crate) trait ValidationStore: Sync {
     fn visible(
         &self,
         namespace: &str,
         digests: &[Digest],
     ) -> impl Future<Output = Result<Vec<Digest>, ValidationError>> + Send;
+    fn read_visible(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, ValidationError>> + Send {
+        async move {
+            if !self
+                .visible(namespace, std::slice::from_ref(digest))
+                .await?
+                .contains(digest)
+            {
+                return Ok(None);
+            }
+            self.read(digest).await
+        }
+    }
+    fn read_visible_many(
+        &self,
+        namespace: &str,
+        digests: &[Digest],
+    ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, ValidationError>> + Send {
+        async move {
+            let mut objects = Vec::new();
+            for digest in digests {
+                objects.push(self.read_visible(namespace, digest).await?);
+            }
+            Ok(objects)
+        }
+    }
     /// Read one bounded protocol object, never an arbitrary artifact.
     fn read(
         &self,
-        digest: &Digest,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, ValidationError>> + Send;
+        _digest: &Digest,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, ValidationError>> + Send {
+        async { Err(ValidationError::internal("unscoped reads unsupported")) }
+    }
 }
 
 #[derive(Debug)]
@@ -49,99 +80,102 @@ fn validate_digest(digest: &Digest) -> Result<(), ValidationError> {
         .map_err(|_| ValidationError::bad_request("invalid digest"))
 }
 
-async fn require_blob(
-    state: &(impl ValidationStore + Sync),
-    namespace: &str,
-    digest: &Digest,
-    label: &str,
-) -> Result<(), ValidationError> {
-    validate_digest(digest)?;
-    if state
-        .visible(namespace, std::slice::from_ref(digest))
-        .await?
-        .contains(digest)
-    {
-        Ok(())
-    } else {
-        Err(ValidationError::unprocessable(format!(
-            "{label} is missing"
-        )))
-    }
-}
-
 pub(crate) async fn validate_tree(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     root: &Digest,
 ) -> Result<(), ValidationError> {
-    enum Visit {
-        Enter(Digest),
-        Exit(Digest),
-    }
-
-    let mut pending = vec![Visit::Enter(root.clone())];
-    let mut visiting = HashSet::new();
-    let mut seen = HashSet::new();
-    while let Some(visit) = pending.pop() {
-        let digest = match visit {
-            Visit::Exit(digest) => {
-                visiting.remove(&digest);
-                seen.insert(digest);
-                continue;
-            }
-            Visit::Enter(digest) => digest,
-        };
-        if seen.contains(&digest) {
-            continue;
-        }
-        if !visiting.insert(digest.clone()) {
-            return Err(ValidationError::unprocessable(
-                "directory graph contains a cycle",
-            ));
-        }
-        if seen.len() + visiting.len() > 100_000 {
-            return Err(ValidationError::unprocessable(
-                "directory graph is too large",
-            ));
-        }
-        if digest.size > 16 * 1024 * 1024 {
-            return Err(ValidationError::unprocessable(
-                "directory object is too large",
-            ));
-        }
-        if !state
-            .visible(namespace, std::slice::from_ref(&digest))
-            .await?
-            .contains(&digest)
-        {
-            return Err(ValidationError::unprocessable(
-                "directory object is missing",
-            ));
-        }
-        let bytes = state
-            .read(&digest)
-            .await?
-            .ok_or_else(|| ValidationError::unprocessable("directory object is missing"))?;
-        let directory: Directory = serde_json::from_slice(&bytes)
-            .map_err(|_| ValidationError::unprocessable("directory object is invalid"))?;
-        if serde_json::to_vec(&directory).map_err(ValidationError::internal)? != bytes {
-            return Err(ValidationError::unprocessable(
-                "directory object is not canonical JSON",
-            ));
-        }
-        if directory.version != 1 {
-            return Err(ValidationError::unprocessable(
-                "unsupported directory object version",
-            ));
-        }
-        validate_directory_entries(&directory)?;
-        let files: Vec<_> = directory
-            .files
-            .into_iter()
-            .map(|file| file.digest)
-            .collect();
-        for digest in &files {
+    use std::collections::{HashMap, VecDeque};
+    let mut pending = VecDeque::from([root.clone()]);
+    let mut discovered = HashSet::from([root.clone()]);
+    let mut references = HashSet::new();
+    let mut graph = HashMap::<Digest, Vec<Digest>>::new();
+    let mut protocol_bytes = 0u64;
+    let mut entries = 0usize;
+    while !pending.is_empty() {
+        // A frontier has at most 16 MiB of bodies, even with six concurrent R2 reads.
+        let mut frontier = Vec::new();
+        let mut bytes = 0u64;
+        while let Some(digest) = pending.front() {
             validate_digest(digest)?;
+            if digest.size > 16 * 1024 * 1024 {
+                return Err(ValidationError::unprocessable(
+                    "directory object is too large",
+                ));
+            }
+            if frontier.len() == 16 || bytes + digest.size > 16 * 1024 * 1024 {
+                break;
+            }
+            bytes += digest.size;
+            frontier.push(pending.pop_front().unwrap());
+        }
+        protocol_bytes = protocol_bytes.saturating_add(bytes);
+        if protocol_bytes > 64 * 1024 * 1024 {
+            return Err(ValidationError::unprocessable(
+                "directory graph exceeds byte budget",
+            ));
+        }
+        let objects = state.read_visible_many(namespace, &frontier).await?;
+        if objects.len() != frontier.len() {
+            return Err(ValidationError::internal("invalid directory read result"));
+        }
+        let mut files = Vec::new();
+        for (digest, body) in frontier.into_iter().zip(objects) {
+            let body =
+                body.ok_or_else(|| ValidationError::unprocessable("directory object is missing"))?;
+            let directory: Directory = serde_json::from_slice(&body)
+                .map_err(|_| ValidationError::unprocessable("directory object is invalid"))?;
+            if serde_json::to_vec(&directory).map_err(ValidationError::internal)? != body {
+                return Err(ValidationError::unprocessable(
+                    "directory object is not canonical JSON",
+                ));
+            }
+            if directory.version != 1 {
+                return Err(ValidationError::unprocessable(
+                    "unsupported directory object version",
+                ));
+            }
+            entries = entries
+                .saturating_add(directory.files.len())
+                .saturating_add(directory.directories.len())
+                .saturating_add(directory.symlinks.len());
+            if entries > 100_000 {
+                return Err(ValidationError::unprocessable(
+                    "directory graph exceeds entry budget",
+                ));
+            }
+            validate_directory_entries(&directory)?;
+            let children: Vec<_> = directory
+                .directories
+                .into_iter()
+                .map(|node| node.digest)
+                .collect();
+            let current_files: Vec<_> = directory
+                .files
+                .into_iter()
+                .map(|node| node.digest)
+                .collect();
+            for reference in children.iter().chain(&current_files) {
+                validate_digest(reference)?;
+                references.insert(reference.clone());
+            }
+            if references.len() > 100_000 {
+                return Err(ValidationError::unprocessable(
+                    "directory graph exceeds reference budget",
+                ));
+            }
+            for child in &children {
+                if discovered.insert(child.clone()) {
+                    pending.push_back(child.clone());
+                }
+            }
+            if discovered.len() > 4096 {
+                return Err(ValidationError::unprocessable(
+                    "directory graph is too large",
+                ));
+            }
+            files.extend(current_files);
+            graph.insert(digest, children);
         }
         let visible: HashSet<_> = state
             .visible(namespace, &files)
@@ -151,13 +185,45 @@ pub(crate) async fn validate_tree(
         if files.iter().any(|digest| !visible.contains(digest)) {
             return Err(ValidationError::unprocessable("file blob is missing"));
         }
-        pending.push(Visit::Exit(digest));
-        pending.extend(
-            directory
-                .directories
-                .into_iter()
-                .map(|node| Visit::Enter(node.digest)),
-        );
+    }
+    // Topological processing detects cycles and the longest path, including DAGs
+    // whose shortest path would hide an over-depth branch during BFS.
+    let mut incoming = HashMap::<Digest, usize>::new();
+    for (parent, children) in &graph {
+        incoming.entry(parent.clone()).or_default();
+        for child in children {
+            *incoming.entry(child.clone()).or_default() += 1;
+        }
+    }
+    let mut ready: VecDeque<_> = incoming
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut depth = HashMap::from([(root.clone(), 1usize)]);
+    let mut visited = 0;
+    while let Some(parent) = ready.pop_front() {
+        visited += 1;
+        let current = *depth.get(&parent).unwrap_or(&1);
+        if current > 128 {
+            return Err(ValidationError::unprocessable(
+                "directory graph is too deep",
+            ));
+        }
+        for child in &graph[&parent] {
+            let child_depth = depth.entry(child.clone()).or_default();
+            *child_depth = (*child_depth).max(current + 1);
+            let count = incoming.get_mut(child).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(child.clone());
+            }
+        }
+    }
+    if visited != graph.len() {
+        return Err(ValidationError::unprocessable(
+            "directory graph contains a cycle",
+        ));
     }
     Ok(())
 }
@@ -185,7 +251,7 @@ pub(crate) fn validate_action_result_shape(
 }
 
 pub(crate) async fn validate_action_descriptor(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     digest: &Digest,
 ) -> Result<ActionKind, ValidationError> {
@@ -325,7 +391,7 @@ pub(crate) fn validate_rustc_action(
 }
 
 pub(crate) async fn validate_client_metadata(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     digest: &Digest,
     action_kind: ActionKind,
@@ -364,7 +430,7 @@ pub(crate) async fn validate_client_metadata(
 }
 
 async fn validate_build_script_metadata(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     value: serde_json::Value,
     version: u64,
@@ -394,7 +460,7 @@ async fn validate_build_script_metadata(
 }
 
 async fn validate_cc_metadata(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     value: serde_json::Value,
     version: u64,
@@ -433,7 +499,7 @@ fn validate_task_metadata(value: serde_json::Value, version: u64) -> Result<(), 
 }
 
 async fn validate_rustc_metadata(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     value: serde_json::Value,
     version: u64,
@@ -462,14 +528,23 @@ async fn validate_rustc_metadata(
 }
 
 async fn require_output_blobs(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     stdout: &Digest,
     stderr: &Digest,
     kind: &str,
 ) -> Result<(), ValidationError> {
-    require_blob(state, namespace, stdout, &format!("{kind} stdout blob")).await?;
-    require_blob(state, namespace, stderr, &format!("{kind} stderr blob")).await
+    validate_digest(stdout)?;
+    validate_digest(stderr)?;
+    let visible = state
+        .visible(namespace, &[stdout.clone(), stderr.clone()])
+        .await?;
+    if !visible.contains(stdout) || !visible.contains(stderr) {
+        return Err(ValidationError::unprocessable(format!(
+            "{kind} output blob is missing"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_task_root(root: &str) -> Result<(), ValidationError> {
@@ -488,7 +563,7 @@ pub(crate) fn validate_task_root(root: &str) -> Result<(), ValidationError> {
 }
 
 async fn read_canonical_object(
-    state: &(impl ValidationStore + Sync),
+    state: &impl ValidationStore,
     namespace: &str,
     digest: &Digest,
     label: &str,
@@ -499,17 +574,8 @@ async fn read_canonical_object(
             "{label} is too large"
         )));
     }
-    if !state
-        .visible(namespace, std::slice::from_ref(digest))
-        .await?
-        .contains(digest)
-    {
-        return Err(ValidationError::unprocessable(format!(
-            "{label} blob is missing"
-        )));
-    }
     let bytes = state
-        .read(digest)
+        .read_visible(namespace, digest)
         .await?
         .ok_or_else(|| ValidationError::unprocessable(format!("{label} blob is missing")))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -558,4 +624,119 @@ fn validate_entry(
         return Err(ValidationError::unprocessable("duplicate directory entry"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+    #[derive(Default)]
+    struct Objects {
+        bodies: HashMap<Digest, Vec<u8>>,
+        reads: AtomicUsize,
+    }
+    impl ValidationStore for Objects {
+        async fn visible(
+            &self,
+            _: &str,
+            digests: &[Digest],
+        ) -> Result<Vec<Digest>, ValidationError> {
+            Ok(digests
+                .iter()
+                .filter(|d| self.bodies.contains_key(*d))
+                .cloned()
+                .collect())
+        }
+        async fn read(&self, digest: &Digest) -> Result<Option<Vec<u8>>, ValidationError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.bodies.get(digest).cloned())
+        }
+    }
+    // The fake store completes synchronously, so a pending future is a test failure.
+    fn run<T>(future: impl Future<Output = T>) -> T {
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        match std::pin::pin!(future)
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+        {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("fake store yielded"),
+        }
+    }
+    fn directory(children: &[Digest]) -> Vec<u8> {
+        let value = serde_json::json!({"version":1,"directories":children.iter().enumerate().map(|(i,d)|serde_json::json!({"name":format!("n{i}"),"mode":493,"digest":d})).collect::<Vec<_>>(),"files":[],"symlinks":[]});
+        serde_json::to_vec(&serde_json::from_value::<Directory>(value).unwrap()).unwrap()
+    }
+    fn add(store: &mut Objects, children: &[Digest]) -> Digest {
+        let bytes = directory(children);
+        let digest = Digest {
+            algorithm: "blake3".into(),
+            hash: blake3::hash(&bytes).to_hex().to_string(),
+            size: bytes.len() as u64,
+        };
+        store.bodies.insert(digest.clone(), bytes);
+        digest
+    }
+    #[test]
+    fn aggregate_budget_is_charged_before_next_read() {
+        let mut store = Objects::default();
+        let keys: Vec<_> = (0..5)
+            .map(|i| Digest {
+                algorithm: "blake3".into(),
+                hash: format!("{i:064x}"),
+                size: 16 * 1024 * 1024,
+            })
+            .collect();
+        for i in 0..5 {
+            store.bodies.insert(
+                keys[i].clone(),
+                directory(if i < 4 {
+                    std::slice::from_ref(&keys[i + 1])
+                } else {
+                    &[]
+                }),
+            );
+        }
+        assert!(
+            run(validate_tree(&store, "n", &keys[0]))
+                .unwrap_err()
+                .message
+                .contains("byte budget")
+        );
+        assert_eq!(store.reads.load(Ordering::Relaxed), 4);
+    }
+    #[test]
+    fn longest_shared_path_enforces_depth() {
+        let mut store = Objects::default();
+        let leaf = add(&mut store, &[]);
+        let mut chain = leaf.clone();
+        for _ in 0..128 {
+            chain = add(&mut store, &[chain]);
+        }
+        let root = add(&mut store, &[leaf, chain]);
+        assert!(
+            run(validate_tree(&store, "n", &root))
+                .unwrap_err()
+                .message
+                .contains("too deep")
+        );
+    }
+    #[test]
+    fn shared_subtrees_are_valid_and_read_once() {
+        let mut store = Objects::default();
+        let leaf = add(&mut store, &[]);
+        let branch = add(&mut store, std::slice::from_ref(&leaf));
+        let root = add(&mut store, &[leaf, branch]);
+        run(validate_tree(&store, "n", &root)).unwrap();
+        assert_eq!(store.reads.load(Ordering::Relaxed), 3);
+    }
 }

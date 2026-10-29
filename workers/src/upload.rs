@@ -22,6 +22,66 @@ pub async fn upload<S>(store: &Store, namespace: &str, digest: &Digest, input: S
 where
     S: Stream<Item = Result<Vec<u8>>>,
 {
+    let (key, fresh) = stage(store, digest, input).await?;
+    store
+        .register_many(namespace, &[(digest.clone(), key, fresh)])
+        .await?;
+    Ok(false)
+}
+
+/// Verify content even for cross-namespace deduplication. Healthy pointers avoid R2 writes.
+pub async fn stage<S>(store: &Store, digest: &Digest, input: S) -> Result<(String, bool)>
+where
+    S: Stream<Item = Result<Vec<u8>>>,
+{
+    if digest.size > store.max_blob_bytes {
+        return Err(Error::new(413, "blob exceeds configured limit"));
+    }
+    if let Some(key) = store.object_key(digest).await?
+        && store
+            .bucket
+            .head(&key)
+            .await?
+            .is_some_and(|o| o.size() == digest.size)
+    {
+        futures_util::pin_mut!(input);
+        let mut count = 0u64;
+        let mut blake3 = blake3::Hasher::new();
+        let mut sha256 = sha2::Sha256::new();
+        while let Some(chunk) = input.next().await {
+            let chunk = chunk?;
+            count = count
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::new(413, "blob too large"))?;
+            if count > digest.size {
+                return Err(Error::new(413, "blob exceeds declared size"));
+            }
+            if digest.algorithm == "blake3" {
+                blake3.update(&chunk);
+            } else {
+                sha256.update(&chunk);
+            }
+        }
+        let hash = if digest.algorithm == "blake3" {
+            blake3.finalize().to_hex().to_string()
+        } else {
+            hex::encode(sha256.finalize())
+        };
+        if count != digest.size || hash != digest.hash {
+            return Err(Error::new(
+                400,
+                "content does not match the requested digest",
+            ));
+        }
+        return Ok((key, false));
+    }
+    Ok((persist(store, digest, input).await?, true))
+}
+
+pub async fn persist<S>(store: &Store, digest: &Digest, input: S) -> Result<String>
+where
+    S: Stream<Item = Result<Vec<u8>>>,
+{
     if digest.size > store.max_blob_bytes {
         return Err(Error::new(413, "blob exceeds configured limit"));
     }
@@ -103,9 +163,5 @@ where
         return Err(error);
     }
     persisted?;
-    let created = store.register(namespace, digest, &object_key).await?;
-    if !created {
-        store.bucket.delete(&object_key).await?;
-    }
-    Ok(created)
+    Ok(object_key)
 }

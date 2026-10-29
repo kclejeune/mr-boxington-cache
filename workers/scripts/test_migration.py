@@ -86,6 +86,9 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT object_key,created_at FROM blob_objects').fetchone(), ('native/v1/blobs/' + self.blob_key, 99))
         self.assertEqual(self.db.execute('SELECT count(*) FROM namespace_blobs').fetchone()[0], 2)
         self.assertEqual(plan['counts']['unique_blobs'], 1)
+        manifest_key = self.db.execute('SELECT object_key FROM action_manifests').fetchone()[0]
+        self.assertTrue(manifest_key.startswith('workers/v1-imports/manifests/'))
+        self.assertFalse(manifest_key.startswith('workers/v1/'))
 
     def test_new_source_manifests_advance_but_old_snapshots_do_not_roll_them_back(self):
         self.apply()

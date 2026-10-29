@@ -331,7 +331,7 @@ fn plan(args: &Args) -> Result<Plan> {
         let name = format!("manifest-{}.json", files.len());
         fs::write(args.output.join(&name), bytes)?;
         let key = format!(
-            "{}/imported-manifests/{}/{}",
+            "{}-imports/manifests/{}/{}",
             args.worker_prefix.trim_matches('/'),
             blake3::hash(namespace.as_bytes()).to_hex(),
             etag

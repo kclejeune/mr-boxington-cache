@@ -4,11 +4,13 @@ mod auth_policy;
 mod compression;
 mod edge;
 mod error;
+mod limits;
 mod maintenance;
 mod metadata;
 #[path = "../../src/model.rs"]
 mod model;
 mod oidc;
+mod routes;
 mod upload;
 #[path = "../../src/validation.rs"]
 mod validation;
@@ -26,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use worker::{Context, Env, Method, Request, Response, event};
 
-const WORKER_BATCH_LIMIT: usize = 256;
-const JSON_LIMIT: usize = 2 * 1024 * 1024;
+const WORKER_BATCH_LIMIT: usize = 16;
+const JSON_LIMIT: usize = 1024 * 1024;
+const ACTION_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_BLOB_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -48,6 +51,7 @@ async fn fetch(mut request: Request, env: Env, ctx: Context) -> worker::Result<R
 async fn handle(request: &mut Request, env: &Env, ctx: &Context) -> Result<Response> {
     let path = request.path();
     let method = request.method();
+    let route = routes::classify(&method, &path)?;
     let max_blob_bytes: u64 = auth::setting(
         env,
         "MBX_CACHE_MAX_BLOB_BYTES",
@@ -60,14 +64,37 @@ async fn handle(request: &mut Request, env: &Env, ctx: &Context) -> Result<Respo
             "MBX_CACHE_MAX_BLOB_BYTES must be between 1 and 4294967295",
         ));
     }
+    let ingress_limit: u64 =
+        auth::setting(env, "MBX_CACHE_WORKERS_REQUEST_LIMIT_BYTES", "100000000")
+            .parse()
+            .map_err(Error::internal)?;
+    validate_ingress(max_blob_bytes, ingress_limit)?;
     if path == "/v1/status" && method == Method::Get {
         return json(&serde_json::json!({"status":"ok","protocol":PROTOCOL_VERSION}));
     }
     if path == "/v1/capabilities" && method == Method::Get {
         return capabilities(max_blob_bytes);
     }
-    let write = method == Method::Put || path == "/v1/blobs:pack-upload";
-    let namespace = auth::authorize(env, request.headers(), write).await?;
+    let write = route.access() == routes::Access::Write;
+    let principal = auth::authorize(env, request.headers(), write).await?;
+    let reserved_bytes = match route {
+        // Pack reads charge their validated requested payload below, before D1/R2 work.
+        routes::Route::PackRead => 0,
+        routes::Route::PackWrite => max_blob_bytes + 8 + 41 * WORKER_BATCH_LIMIT as u64,
+        routes::Route::BlobWrite => max_blob_bytes,
+        routes::Route::ActionWrite => 64 * 1024 * 1024 + JSON_LIMIT as u64,
+        routes::Route::ManifestWrite | routes::Route::ManifestRead => MANIFEST_LIMIT as u64,
+        routes::Route::Batch => ACTION_BATCH_BYTES as u64,
+        routes::Route::BlobRead => path
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0),
+        _ => JSON_LIMIT as u64,
+    };
+    limits::check(env, &principal, route.budget(&path), reserved_bytes).await?;
+    routes::validate_body(request, route, max_blob_bytes)?;
+    let namespace = principal.namespace.clone();
     let parts: Vec<_> = path.split('/').collect();
     if matches!(method, Method::Get | Method::Head)
         && parts.len() == 6
@@ -79,24 +106,10 @@ async fn handle(request: &mut Request, env: &Env, ctx: &Context) -> Result<Respo
     }
     if method == Method::Post && path == "/v1/action-results:batch" {
         let digests = digest_list(request, true).await?;
-        let responses = futures_util::stream::iter(digests.iter())
-            .map(|digest| async {
-                let mut response =
-                    edge::read(ctx, env, &namespace, "action-results", digest, Method::Get).await?;
-                match response.status_code() {
-                    200 => Ok(Some(response.json::<ActionResult>().await?)),
-                    404 => Ok(None),
-                    _ => Err(Error::new(502, "action batch backend failed")),
-                }
-            })
-            .buffered(6)
-            .collect::<Vec<_>>()
-            .await;
-        let mut results = Vec::<ActionResult>::new();
-        for response in responses {
-            if let Some(result) = response? {
-                results.push(result);
-            }
+        // A bounded bulk query avoids one internal/D1 miss per cold member.
+        let results = store(env, false)?.get_results(&namespace, &digests).await?;
+        if serde_json::to_vec(&results)?.len() > ACTION_BATCH_BYTES {
+            return Err(Error::new(413, "action batch response is too large"));
         }
         return media_json(
             &serde_json::json!({"results":results}),
@@ -104,7 +117,7 @@ async fn handle(request: &mut Request, env: &Env, ctx: &Context) -> Result<Respo
         );
     }
     if method == Method::Post && path == "/v1/blobs:pack" {
-        return download_pack(request, env, ctx, &namespace, max_blob_bytes).await;
+        return download_pack(request, env, &principal, max_blob_bytes).await;
     }
     let store = store(env, write)?;
     match (method, path.as_str()) {
@@ -146,12 +159,9 @@ async fn resource(
                 .visible_object(namespace, &digest)
                 .await?
                 .ok_or_else(|| Error::new(404, "blob not found"))?;
-            let object = store
-                .bucket
-                .head(key)
-                .await?
-                .ok_or_else(|| Error::new(404, "blob not found"))?;
-            if object.size() != digest.size {
+            let object = store.bucket.head(&key).await?;
+            if !object.is_some_and(|o| o.size() == digest.size) {
+                store.repair_blob(&digest, &key).await?;
                 return Err(Error::new(404, "blob not found"));
             }
             let mut response = Response::empty()?;
@@ -174,12 +184,14 @@ async fn resource(
                 .visible_object(namespace, &digest)
                 .await?
                 .ok_or_else(|| Error::new(404, "blob not found"))?;
-            let object = store
-                .bucket
-                .get(key)
-                .execute()
-                .await?
-                .ok_or_else(|| Error::new(404, "blob not found"))?;
+            let Some(object) = store.bucket.get(&key).execute().await? else {
+                store.repair_blob(&digest, &key).await?;
+                return Err(Error::new(404, "blob not found"));
+            };
+            if object.size() != digest.size {
+                store.repair_blob(&digest, &key).await?;
+                return Err(Error::new(404, "blob not found"));
+            }
             let body = object
                 .body()
                 .ok_or_else(|| Error::new(500, "missing object body"))?
@@ -206,8 +218,8 @@ async fn resource(
                 store.max_blob_bytes,
                 digest.size.min(store.max_blob_bytes),
             )?;
-            let created = upload::upload(store, namespace, &digest, stream).await?;
-            empty(if created { 201 } else { 204 })
+            upload::upload(store, namespace, &digest, stream).await?;
+            empty(204)
         }
         (Method::Get | Method::Head, "action-results") => {
             let results = store.get_results(namespace, &[digest]).await?;
@@ -222,6 +234,17 @@ async fn resource(
                 serde_json::from_slice(&read_body(request, JSON_LIMIT).await?)?;
             if result.version != 1 || result.action != digest {
                 return Err(Error::new(400, "action result does not match request"));
+            }
+            if let Some(existing) = store
+                .get_results(namespace, std::slice::from_ref(&digest))
+                .await?
+                .first()
+            {
+                return if existing == &result {
+                    empty(204)
+                } else {
+                    Err(Error::new(409, "an immutable action result already exists"))
+                };
             }
             let kind = validation::validate_action_descriptor(store, namespace, &digest).await?;
             validation::validate_action_result_shape(&result, kind)?;
@@ -244,11 +267,18 @@ async fn resource(
                 .execute()
                 .await?
                 .ok_or_else(|| Error::new(404, "action manifest not found"))?;
-            let body = object
+            if object.size() > MANIFEST_LIMIT as u64 {
+                return Err(Error::new(404, "action manifest not found"));
+            }
+            let bytes = object
                 .body()
                 .ok_or_else(|| Error::new(500, "missing manifest body"))?
-                .response_body()?;
-            let mut response = Response::from_body(body)?;
+                .bytes()
+                .await?;
+            if blake3::hash(&bytes).to_hex().as_str() != record.etag {
+                return Err(Error::new(404, "action manifest not found"));
+            }
+            let mut response = Response::from_bytes(bytes)?;
             response
                 .headers_mut()
                 .set("content-type", TASK_ACTION_MANIFEST_MEDIA_TYPE)?;
@@ -263,6 +293,18 @@ async fn resource(
         }
         _ => Err(Error::new(404, "not found")),
     }
+}
+
+fn validate_ingress(blob_limit: u64, ingress_limit: u64) -> Result<()> {
+    let framed = blob_limit
+        .checked_add(8 + 41 * WORKER_BATCH_LIMIT as u64 + 1024 * 1024)
+        .ok_or_else(|| Error::internal("upload limits overflow"))?;
+    if framed > ingress_limit {
+        return Err(Error::internal(
+            "blob/pack limits plus framing and 1 MiB safety margin exceed MBX_CACHE_WORKERS_REQUEST_LIMIT_BYTES",
+        ));
+    }
+    Ok(())
 }
 
 fn capabilities(max_blob_bytes: u64) -> Result<Response> {
@@ -334,6 +376,7 @@ async fn digest_list(request: &mut Request, action: bool) -> Result<Vec<Digest>>
 }
 async fn read_body(request: &mut Request, limit: usize) -> Result<Vec<u8>> {
     identity(request)?;
+    routes::content_length(request, limit as u64)?;
     let mut stream = request.stream()?;
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -396,6 +439,13 @@ async fn put_manifest(
             .ok_or_else(|| Error::new(400, "If-Match must contain one strong BLAKE3 ETag"))?;
         Some(etag.to_owned())
     };
+    let current = store.manifest(namespace, key).await?;
+    if current.as_ref().map(|row| row.etag.as_str()) != expected.as_deref() {
+        return Err(Error::new(
+            412,
+            "action manifest changed; read and merge it before retrying",
+        ));
+    }
     let manifest: TaskActionManifest =
         serde_json::from_slice(&read_body(request, MANIFEST_LIMIT).await?)?;
     if !manifest.validate() || manifest.selector_digest() != *key {
@@ -424,8 +474,7 @@ async fn put_manifest(
 async fn download_pack(
     request: &mut Request,
     env: &Env,
-    ctx: &Context,
-    namespace: &str,
+    principal: &auth::Principal,
     max_blob_bytes: u64,
 ) -> Result<Response> {
     let digests = digest_list(request, false).await?;
@@ -436,56 +485,53 @@ async fn download_pack(
     if total > max_blob_bytes {
         return Err(Error::new(413, "pack exceeds configured limit"));
     }
-    let responses = futures_util::stream::iter(digests.iter())
-        .map(|digest| async move {
-            Ok::<_, Error>((
-                digest.clone(),
-                edge::read(ctx, env, namespace, "blobs", digest, Method::Head).await?,
-            ))
-        })
-        .buffered(6)
-        .collect::<Vec<_>>()
-        .await;
+    // Account for artifact payload separately from bounded pack framing/control
+    // overhead. A full legal pack fits the default 64 MiB anonymous payload budget.
+    limits::check_bytes(env, principal, total).await?;
+    let namespace = &principal.namespace;
+    let backend = store(env, false)?;
+    let pointers = backend.visible_objects(namespace, &digests).await?;
     let mut objects = Vec::new();
     let mut bytes = 0u64;
-    for response in responses {
-        let (digest, response) = response?;
-        match response.status_code() {
-            200 => {
-                if response.headers().get("content-length")?.as_deref()
-                    != Some(&digest.size.to_string())
-                {
-                    return Err(Error::new(502, "pack member length mismatch"));
-                }
-                bytes += digest.size;
-                objects.push(digest);
+    for digest in digests {
+        if let Some(key) = pointers.get(&digest.key()) {
+            let object = backend.bucket.head(key).await?;
+            if !object.is_some_and(|object| object.size() == digest.size) {
+                backend.repair_blob(&digest, key).await?;
+                continue;
             }
-            404 => {}
-            _ => return Err(Error::new(502, "blob pack backend failed")),
+            bytes += digest.size;
+            objects.push((digest, key.clone()));
         }
     }
+    worker::console_log!(
+        "mbx.pack members={} bytes={} strategy=bulk",
+        objects.len(),
+        bytes
+    );
     let count = objects.len();
     let length = 8 + count as u64 * 41 + bytes;
-    let env = env.clone();
-    let raw_ctx: &wasm_bindgen::JsValue = ctx.as_ref().as_ref();
-    let ctx = Context::new(wasm_bindgen::JsCast::unchecked_into(raw_ctx.clone()));
-    let namespace = namespace.to_owned();
     let stream = async_stream::try_stream! {
         yield BLOB_PACK_MAGIC.to_vec();
         // Fetch and consume one body at a time. Holding every GET open while
         // collecting headers can exhaust the platform's connection budget.
-        for digest in objects {
-            let mut response = edge::read(&ctx, &env, &namespace, "blobs", &digest, Method::Get).await
-                .map_err(|error| worker::Error::from(error.message))?;
-            if response.status_code() != 200 || response.headers().get("content-length")?.as_deref() != Some(&digest.size.to_string()) {
-                Err(worker::Error::from("pack member disappeared or changed size"))?;
+        for (digest, key) in objects {
+            let object = backend.bucket.get(&key).execute().await?;
+            let Some(object) = object else {
+                backend.repair_blob(&digest,&key).await.map_err(|e| worker::Error::from(e.message))?;
+                Err(worker::Error::from("pack member disappeared"))?;
+                unreachable!();
+            };
+            if object.size() != digest.size {
+                backend.repair_blob(&digest,&key).await.map_err(|e| worker::Error::from(e.message))?;
+                Err(worker::Error::from("pack member changed size"))?;
             }
             let mut header=Vec::with_capacity(41);
             header.push(if digest.algorithm=="blake3"{1}else{2});
             header.extend(hex::decode(&digest.hash).map_err(|e| worker::Error::from(e.to_string()))?);
             header.extend(digest.size.to_be_bytes());
             yield header;
-            let mut body=response.stream()?;
+            let mut body=object.body().ok_or_else(|| worker::Error::from("missing object body"))?.stream()?;
             while let Some(chunk)=body.next().await {yield chunk?;}
         }
     };
@@ -563,7 +609,7 @@ async fn upload_pack(request: &mut Request, store: &Store, namespace: &str) -> R
         return Err(Error::new(400, "invalid blob pack magic"));
     }
     let mut total = 0u64;
-    let mut created = 0u64;
+    let mut staged = Vec::new();
     for _ in 0..count {
         let h = input.exact(41).await?;
         let algorithm = match h[0] {
@@ -592,15 +638,15 @@ async fn upload_pack(request: &mut Request, store: &Store, namespace: &str) -> R
                 remaining-=chunk.len() as u64; yield chunk;
             }
         };
-        if upload::upload(store, namespace, &digest, frame).await? {
-            created += 1;
-        }
+        let key = upload::persist(store, &digest, frame).await?;
+        staged.push((digest, key, true));
     }
     if total != declared || input.take(1).await?.is_some() {
         return Err(Error::new(400, "pack contradicts declared headers"));
     }
+    store.register_many(namespace, &staged).await?;
     media_json(
-        &serde_json::json!({"created":created,"existing":count-created}),
+        &serde_json::json!({"created":0,"existing":count}),
         BLOB_PACK_RECEIPT_MEDIA_TYPE,
     )
 }
@@ -623,6 +669,10 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
 
 fn store(env: &Env, primary: bool) -> Result<Store> {
     Ok(Store {
+        primary: env.d1("MBX_DB")?,
+        trusted_presence: auth::setting(env, "MBX_CACHE_D1_PRESENCE_RECONCILED", "false")
+            .parse()
+            .map_err(Error::internal)?,
         db: env.d1("MBX_DB")?.with_session(Some(if primary {
             "first-primary"
         } else {
@@ -638,6 +688,7 @@ fn store(env: &Env, primary: bool) -> Result<Store> {
         .map_err(Error::internal)?,
         object_prefix: auth::object_prefix(env)?,
         validation_queries: std::sync::atomic::AtomicUsize::new(0),
+        validation_bytes: std::sync::atomic::AtomicU64::new(0),
     })
 }
 fn error_response(error: Error) -> worker::Result<Response> {

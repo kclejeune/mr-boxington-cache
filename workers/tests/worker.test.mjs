@@ -9,6 +9,9 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { blake3 } from '@noble/hashes/blake3.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
+const actionResultType = 'application/vnd.mbx.cache-action-result.v1+json';
+const digestListType = 'application/vnd.mbx.cache-digests.v1+json';
+const manifestType = 'application/vnd.mbx.cache-task-action-manifest.v1+json';
 const packType = 'application/vnd.mbx.cache-blob-pack.v1';
 let mf, db, bucket;
 let oidcKeys, rotatedKeys, ecKeys, ec384Keys, edKeys;
@@ -34,6 +37,7 @@ async function outbound(request) {
     return Response.json({issuer:url.hostname==='mismatch.test'?'https://wrong.test':url.origin,
       jwks_uri:`${url.origin}/keys`,id_token_signing_alg_values_supported:['RS256','RS384','RS512','PS256','PS384','PS512','ES256','ES384','EdDSA']});
   }
+  if (url.hostname==='redirect.test' && url.pathname==='/keys') return new Response('',{status:302,headers:{location:'http://downgrade.test/keys'}});
   if (url.pathname==='/keys') {
     if (url.hostname==='fallback.test' && failFallback) return new Response('unavailable',{status:503});
     const keys=url.hostname==='issuer.test' && rotated?rotatedKeys:oidcKeys;
@@ -61,7 +65,7 @@ function jwt(claims={},options={}) {
       algorithm.startsWith('PS')?{key,padding:cconst.RSA_PKCS1_PSS_PADDING,saltLength:algorithm.endsWith('384')?48:algorithm.endsWith('512')?64:32}:key);
   return `${input}.${signature.toString('base64url')}`;
 }
-function runtime(bindings={}) {
+function runtime(bindings={}, ratelimits={}) {
   const options=convertV4MiniflareOptions({ workers: [{
     name: "mbx-cache",
     modulesRoot: root,
@@ -71,9 +75,11 @@ function runtime(bindings={}) {
       {type:'CompiledWasm',path:`${root}build/index_bg.wasm`},
     ],
     outboundService: outbound,
+    ratelimits,
     compatibilityDate: '2026-10-28',
     d1Databases: ['MBX_DB'], r2Buckets: ['MBX_BLOBS'],
     bindings: {
+      MBX_CACHE_RATE_LIMIT_MODE:'off',
       MBX_CACHE_TOKENS_JSON: JSON.stringify([
         { token: 'test-token', read: ['test/*'], write: ['test/*'] },
         { token: 'read-token', read: ['test/*'], write: [] },
@@ -116,10 +122,19 @@ function canonical(value) {
 }
 const encode = value => Buffer.from(JSON.stringify(canonical(value)));
 const path = (kind, d) => `/v1/${kind}/${d.algorithm}/${d.hash}/${d.size}`;
+function requestMediaType(url, method) {
+  if (method === 'PUT') {
+    if (url.includes('/blobs/')) return 'application/octet-stream';
+    if (url.includes('/action-results/')) return actionResultType;
+    if (url.includes('/action-manifests/')) return manifestType;
+  }
+  if (method === 'POST' && ['/v1/blobs:missing','/v1/blobs:pack','/v1/action-results:batch'].includes(url.split('?')[0])) return digestListType;
+  return 'application/json';
+}
 function request(url, method = 'GET', body, headers = {}) {
   return mf.dispatchFetch(`https://cache.example${url}`, {
     method, body, ...(body instanceof ReadableStream ? {duplex:"half"} : {}),
-    headers: { 'mbx-cache-protocol': '1', 'mbx-cache-namespace': 'test/project', authorization: 'Bearer test-token', ...headers },
+    headers: { 'content-type': requestMediaType(url, method), 'mbx-cache-protocol': '1', 'mbx-cache-namespace': 'test/project', authorization: 'Bearer test-token', ...headers },
   });
 }
 async function put(bytes, algorithm = 'blake3', headers = {}) {
@@ -146,7 +161,7 @@ test('capabilities advertise only supported features and encodings', async () =>
   assert.deepEqual(c.compressors,['identity','zstd']);
   assert.equal(c.features.blob_pack_uploads,true);
   assert.equal(c.features.action_promises,false);
-  assert.equal(c.limits.max_batch_items,256);
+  assert.equal(c.limits.max_batch_items,16);
 });
 
 test('requires protocol, authorization, namespace and immutable preconditions', async () => {
@@ -172,8 +187,7 @@ test('streams BLAKE3, SHA256 and empty blobs; deduplicates concurrent uploads', 
   }
   const bytes=Buffer.alloc(256*1024,62),d=digest(bytes);
   const statuses=await Promise.all(Array.from({length:4},async()=> (await request(path('blobs',d),'PUT',bytes,{'if-none-match':'*'})).status));
-  assert.equal(statuses.filter(s=>s===201).length,1);
-  assert.equal(statuses.filter(s=>s===204).length,3);
+  assert.ok(statuses.every(s=>s===204));
 });
 
 test('internal immutable reads enforce authorization, namespace and private downstream headers', async () => {
@@ -234,11 +248,11 @@ test('streams blob packs in both directions, deduplicates members and isolates n
   assert.deepEqual(Buffer.from(await other.arrayBuffer()),Buffer.from('MBXPACK1'));
 });
 
-test('rejects corrupt and truncated packs while keeping earlier verified frames', async () => {
+test('rejects corrupt and truncated packs without publishing earlier verified frames', async () => {
   const a=Buffer.from('good-prefix'),b=Buffer.from('bad-suffix'),entries=[[digest(a),a],[digest(b),Buffer.alloc(b.length)]];
   const response=await request('/v1/blobs:pack-upload','POST',pack(entries),packHeaders(entries));
   assert.equal(response.status,400,await response.clone().text());
-  assert.equal((await request(path('blobs',entries[0][0]))).status,200);
+  assert.equal((await request(path('blobs',entries[0][0]))).status,404);
   assert.equal((await request(path('blobs',entries[1][0]))).status,404);
   const truncated=await request('/v1/blobs:pack-upload','POST',pack(entries).subarray(0,30),packHeaders(entries));
   assert.equal(truncated.status,400);
@@ -303,12 +317,12 @@ test('large manifest bodies stay in R2 and simultaneous updates cannot overwrite
   assert.equal(result.headers.get('etag'),`"${digest(body).hash}"`);
 });
 
-test('batch lookups exceed the D1 placeholder limit without exposing foreign blobs', async () => {
-  const digests=Array.from({length:150},(_,i)=>digest(`batch-${i}`));
+test('batch lookups enforce the advertised limit without exposing foreign blobs', async () => {
+  const digests=Array.from({length:16},(_,i)=>digest(`batch-${i}`));
   const response=await request('/v1/blobs:missing','POST',JSON.stringify({digests}));
   assert.equal(response.status,200);
   assert.deepEqual((await response.json()).missing,digests);
-  const oversized=await request('/v1/blobs:missing','POST',JSON.stringify({digests:Array.from({length:257},()=>digests[0])}));
+  const oversized=await request('/v1/blobs:missing','POST',JSON.stringify({digests:Array.from({length:17},()=>digests[0])}));
   assert.equal(oversized.status,400);
 });
 
@@ -385,7 +399,7 @@ test('zstd uploads stream BLAKE3/SHA256 bodies, concatenated frames and skippabl
   const skip=Buffer.from([0x50,0x2a,0x4d,0x18,3,0,0,0,1,2,3]);
   const bytes=Buffer.concat([a,b]),d=digest(bytes);
   const encoded=Buffer.concat([skip,compressed(a),compressed(b),skip]);
-  assert.equal((await request(path('blobs',d),'PUT',streaming(encoded,1),{'if-none-match':'*','content-encoding':'zstd'})).status,201);
+  assert.equal((await request(path('blobs',d),'PUT',streaming(encoded,1),{'if-none-match':'*','content-encoding':'zstd'})).status,204);
 });
 
 test('corrupt, truncated, oversized-window and expanding zstd uploads never publish', async () => {
@@ -427,7 +441,7 @@ test('OIDC discovers and caches keys across concurrent requests and supports RSA
     assert.equal((await request(url,'GET',undefined,{authorization:`Bearer ${jwt({}, {algorithm,kid,key})}`})).status,404);
   }
   const bytes=Buffer.from('oidc-upload'),upload=await request(path('blobs',digest(bytes)),'PUT',bytes,{'if-none-match':'*',authorization:`Bearer ${token}`});
-  assert.equal(upload.status,201,await upload.clone().text());
+  assert.equal(upload.status,204,await upload.clone().text());
 });
 
 test('OIDC verifies signatures, issuer, audience, expiry, subject, not-before and JWK constraints', async () => {
@@ -509,7 +523,7 @@ test('encoded-byte limits also bound zstd skippable frames that produce no outpu
     const response=await fixture.dispatchFetch(`https://cache.example${path('blobs',digest(''))}`,{
       method:'PUT',body:Buffer.concat([header,Buffer.alloc(2048)]),
       headers:{'mbx-cache-protocol':'1','mbx-cache-namespace':'test/project',authorization:'Bearer test-token',
-        'if-none-match':'*','content-encoding':'zstd'},
+        'if-none-match':'*','content-encoding':'zstd','content-type':'application/octet-stream'},
     });
     assert.equal(response.status,413,await response.clone().text());
     assert.equal((await (await fixture.getR2Bucket('MBX_BLOBS')).list()).objects.length,0);
@@ -553,4 +567,200 @@ test('cleanup is disabled during migration even when retention is configured', a
     assert.equal((await local.prepare('SELECT count(*) AS n FROM blob_objects').first()).n,1);
     assert.equal((await local.prepare('SELECT count(*) AS n FROM maintenance').first()).n,0);
   } finally {await fixture.dispose();}
+});
+
+test('closed routes reject unsupported methods before OIDC discovery', async () => {
+  const before = [...outboundCounts.values()].reduce((a,b)=>a+b,0);
+  for (const [method,url] of [['POST','/v1/future'],['POST',path('blobs',digest('unknown-route'))],['HEAD','/v1/status'],['DELETE','/v1/blobs:pack-upload']]) {
+    assert.equal((await request(url,method,undefined,{authorization:`Bearer ${jwt()}`})).status,404);
+  }
+  assert.equal([...outboundCounts.values()].reduce((a,b)=>a+b,0),before);
+});
+
+test('body validation rejects declared lengths, media types and action row overflows', async () => {
+  const d=digest('body-controls'), url=path('blobs',d);
+  assert.equal((await request(url,'PUT','x',{'if-none-match':'*','content-type':'text/plain'})).status,415);
+  assert.equal((await request('/v1/blobs:missing','POST','{}',{'content-encoding':'gzip'})).status,415);
+  const result=await request(path('action-results',d),'PUT',' '.repeat(1024*1024+1),{'if-none-match':'*'});
+  assert.equal(result.status,413);
+  const big=await request('/v1/blobs:missing','POST',' '.repeat(1024*1024+1),{'content-length':String(1024*1024+1)});
+  assert.equal(big.status,413);
+});
+
+test('immutable action replays and conflicts skip missing dependencies', async () => {
+  const action=await put(encode({...task(),task:'replay-preflight'}));
+  const result={action,metadata:null,output_root:null,version:1},url=path('action-results',action),headers={'if-none-match':'*'};
+  assert.equal((await request(url,'PUT',encode(result),headers)).status,201);
+  await db.prepare('DELETE FROM namespace_blobs WHERE namespace=? AND blob_key=?').bind('test/project',`${action.algorithm}/${action.hash}/${action.size}`).run();
+  assert.equal((await request(url,'PUT',encode(result),headers)).status,204);
+  assert.equal((await request(url,'PUT',encode({...result,output_root:digest('missing-root')}),headers)).status,409);
+});
+
+test('wrong-sized CAS and corrupted manifests fail without caching', async () => {
+  const d=await put('integrity-check-new');
+  const row=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(`${d.algorithm}/${d.hash}/${d.size}`).first();
+  await bucket.put(row.object_key,'wrong-size');
+  const response=await request(path('blobs',d));
+  assert.equal(response.status,404);
+  assert.match(response.headers.get('cache-control'),/no-store/);
+  assert.equal(await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(`${d.algorithm}/${d.hash}/${d.size}`).first(),null);
+  const task='c'.repeat(64),key=digest(encode({kind:'task_action_manifest',task,version:1}));
+  const url=path('action-manifests',key);
+  assert.equal((await request(url,'PUT',encode({version:1,task,predictions:[]}),{'if-none-match':'*'})).status,201);
+  const manifest=await db.prepare('SELECT object_key FROM action_manifests WHERE action_key=?').bind(`${key.algorithm}/${key.hash}/${key.size}`).first();
+  await bucket.put(manifest.object_key,'{}');
+  assert.equal((await request(url)).status,404);
+});
+
+test('duplicate single uploads avoid new R2 objects and normalize namespace status', async () => {
+  const bytes=Buffer.from('redundancy-test-unique'),d=await put(bytes);
+  const before=(await bucket.list({prefix:'workers/v1/blobs/'})).objects.length;
+  for(const namespace of ['test/project','test/dedup-proof']) {
+    assert.equal((await request(path('blobs',d),'PUT',bytes,{'if-none-match':'*','mbx-cache-namespace':namespace})).status,204);
+  }
+  assert.equal((await bucket.list({prefix:'workers/v1/blobs/'})).objects.length,before);
+});
+
+test('authentication configuration rejects invalid static patterns, duplicates and insecure OIDC', async () => {
+  for(const bindings of [
+    {MBX_CACHE_TOKENS_JSON:JSON.stringify([{token:'',read:['*']}])},
+    {MBX_CACHE_TOKENS_JSON:JSON.stringify([{token:'x',read:['../bad']}])},
+    {MBX_CACHE_TOKENS_JSON:JSON.stringify([{token:'x',read:['*']},{token:'x',read:['*']}])},
+    {MBX_CACHE_ANONYMOUS_READ_NAMESPACES_JSON:'["bad/**"]'},
+    {MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify([{...providers[0],jwks_uri:'http://issuer.test/keys'}])},
+    {MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify([{...providers[0],clock_skew_seconds:301}])},
+    {MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify([{...providers[0],jwks_refresh_seconds:86401}])},
+    {MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify([{...providers[0],rules:[{claims:{repository:[]},read:['*']}]}])},
+  ]) {
+    const fixture=runtime(bindings);
+    try {
+      const response=await fixture.dispatchFetch(`https://cache.example${path('blobs',digest('invalid-config'))}`,{headers:{'mbx-cache-protocol':'1','mbx-cache-namespace':'test/project',authorization:'Bearer test-token'}});
+      assert.equal(response.status,500);
+    } finally {await fixture.dispose();}
+  }
+  assert.equal((await request(path('blobs',digest('long-token')),'GET',undefined,{authorization:`Bearer ${'x'.repeat(16385)}`})).status,401);
+});
+
+test('post-auth limits fail closed and use stable principals across namespaces', async () => {
+  const fixture=runtime({MBX_CACHE_RATE_LIMIT_MODE:'enforce',MBX_CACHE_PRINCIPAL_KEY:'local-test-principal-key-32-bytes-long'}, {
+    MBX_LIMIT_READ:{namespace_id:'991',simple:{limit:1,period:60}},
+    MBX_LIMIT_BYTES:{namespace_id:'992',simple:{limit:100,period:60}},
+  });
+  try {
+    const database=await fixture.getD1Database('MBX_DB');
+    for (const statement of (await readFile(`${root}migrations/0001_init.sql`,'utf8')).replace(/^--.*$/gm,'').split(';').filter(s=>s.trim())) await database.prepare(statement).run();
+    const call=namespace=>fixture.dispatchFetch(`https://cache.example${path('blobs',digest('limited'))}`,{headers:{'mbx-cache-protocol':'1','mbx-cache-namespace':namespace,authorization:'Bearer test-token'}});
+    assert.equal((await call('test/one')).status,404);
+    assert.equal((await call('test/two')).status,429);
+  } finally {await fixture.dispose();}
+});
+
+test('OIDC redirect downgrade never reaches an insecure endpoint', async () => {
+  const fixture=runtime({MBX_CACHE_OIDC_PROVIDERS_JSON:JSON.stringify([{...providers[0],issuer:'https://redirect.test',jwks_uri:'https://redirect.test/keys'}])});
+  try {
+    const response=await fixture.dispatchFetch(`https://cache.example${path('blobs',digest('redirect'))}`,{headers:{'mbx-cache-protocol':'1','mbx-cache-namespace':'test/project',authorization:`Bearer ${jwt({iss:'https://redirect.test'})}`}});
+    assert.equal(response.status,401);
+    assert.equal(outboundCounts.get('http://downgrade.test/keys'),undefined);
+  } finally {await fixture.dispose();}
+});
+
+test('the same action key stays isolated with different namespace results in both read orders', async () => {
+  const body=encode({...task(),task:'namespace-action-isolation'}),action=await put(body);
+  const namespace={'mbx-cache-namespace':'test/action-other'};
+  await put(body,'blake3',namespace);
+  const root=await put(encode({version:1,directories:[],files:[],symlinks:[]}),'blake3',namespace);
+  const a={action,metadata:null,output_root:null,version:1};
+  const b={...a,output_root:root};
+  const url=path('action-results',action);
+  assert.equal((await request(url,'PUT',encode(a),{'if-none-match':'*'})).status,201);
+  assert.equal((await request(url,'PUT',encode(b),{'if-none-match':'*',...namespace})).status,201);
+  for(const [headers,expected] of [[{},a],[namespace,b],[namespace,b],[{},a]]) {
+    const response=await request(url+'?namespace=caller-controlled&epoch=caller-controlled','GET',undefined,headers);
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),expected);
+    assert.equal(response.headers.get('cache-control'),'private, no-store');
+  }
+});
+
+test('configured ingress limit must cover advertised packs and framing', async () => {
+  const fixture=runtime({MBX_CACHE_WORKERS_REQUEST_LIMIT_BYTES:'67108864'});
+  try {
+    assert.equal((await fixture.dispatchFetch('https://cache.example/v1/capabilities')).status,500);
+  } finally {await fixture.dispose();}
+});
+
+
+test('protocol JSON types accept parameters and reject mismatched vendor types', async () => {
+  const action=await put(encode({...task(),task:'media-type-regression'}));
+  const result={action,metadata:null,output_root:null,version:1};
+  const url=path('action-results',action);
+  assert.equal((await request(url,'PUT',encode(result),{'if-none-match':'*','content-type':digestListType})).status,415);
+  assert.equal((await request(url,'PUT',encode(result),{'if-none-match':'*','content-type':`${actionResultType}; charset=utf-8`})).status,201);
+  assert.equal((await request(url,'PUT',encode(result),{'if-none-match':'*','content-type':'application/json'})).status,204);
+  for(const endpoint of ['/v1/blobs:missing','/v1/blobs:pack','/v1/action-results:batch']) {
+    for(const contentType of [digestListType, `${digestListType}; charset=utf-8`, 'application/json']) {
+      const response=await request(endpoint,'POST',encode({digests:[action]}),{'content-type':contentType});
+      assert.equal(response.status,200,await response.clone().text());
+      await response.arrayBuffer();
+    }
+    assert.equal((await request(endpoint,'POST',encode({digests:[]}),{'content-type':actionResultType})).status,415);
+  }
+});
+
+test('anonymous pack downloads charge requested payload within the default byte budget', async () => {
+  const config=JSON.parse(await readFile(`${root}wrangler.jsonc`,'utf8'));
+  const ratelimits=Object.fromEntries(config.ratelimits.filter(binding=>binding.name.startsWith('MBX_LIMIT_ANONYMOUS')).map(({name,...binding})=>[name,binding]));
+  const fixture=runtime({MBX_CACHE_RATE_LIMIT_MODE:'enforce',MBX_CACHE_PRINCIPAL_KEY:'local-test-principal-key-32-bytes-long'},ratelimits);
+  try {
+    const database=await fixture.getD1Database('MBX_DB');
+    for(const statement of (await readFile(`${root}migrations/0001_init.sql`,'utf8')).replace(/^--.*$/gm,'').split(';').filter(s=>s.trim())) await database.prepare(statement).run();
+    const bytes=Buffer.from('public-pack-payload'),d=digest(bytes),key='anonymous-pack-fixture';
+    await (await fixture.getR2Bucket('MBX_BLOBS')).put(key,bytes);
+    await database.prepare('INSERT INTO blob_objects(blob_key,object_key) VALUES (?,?)').bind(`${d.algorithm}/${d.hash}/${d.size}`,key).run();
+    await database.prepare('INSERT INTO namespace_blobs(namespace,blob_key) VALUES (?,?)').bind('public/cache',`${d.algorithm}/${d.hash}/${d.size}`).run();
+    const call=digests=>fixture.dispatchFetch('https://cache.example/v1/blobs:pack',{method:'POST',body:encode({digests}),headers:{'content-type':digestListType,'mbx-cache-protocol':'1','mbx-cache-namespace':'public/cache'}});
+    const empty=await call([]);
+    assert.equal(empty.status,200);
+    assert.deepEqual(Buffer.from(await empty.arrayBuffer()),pack([]));
+    // The requested payload reaches 64 MiB; missing members need no large fixture body.
+    const missing={...digest('unavailable-anonymous-member'),size:67108864-d.size};
+    const full=await call([d,missing]);
+    assert.equal(full.status,200,await full.clone().text());
+    assert.equal(full.headers.get('mbx-cache-pack-blobs'),'1');
+    assert.deepEqual(Buffer.from(await full.arrayBuffer()),pack([[d,bytes]]));
+    // Four payload units were charged, rather than five including framing.
+    assert.equal((await call([d])).status,429);
+  } finally {await fixture.dispose();}
+});
+
+test('blob reads above u32 size reach storage while uploads remain bounded', async () => {
+  const d={...digest('large-imported-metadata'),size:2**32};
+  for(const method of ['GET','HEAD']) {
+    assert.equal((await request(path('blobs',d),method)).status,404);
+  }
+  assert.equal((await request(path('blobs',d),'PUT','',{'if-none-match':'*'})).status,413);
+});
+
+test('pack downloads omit and repair expired or wrong-sized members while keeping healthy members', async () => {
+  const healthyBytes=Buffer.from('healthy-mixed-pack-member');
+  const healthy=await put(healthyBytes),expired=await put('expired-mixed-pack-member'),wrong=await put('wrong-sized-mixed-pack-member');
+  const key=d=>`${d.algorithm}/${d.hash}/${d.size}`;
+  const expiredRow=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(key(expired)).first();
+  const wrongRow=await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(key(wrong)).first();
+  await bucket.delete(expiredRow.object_key);
+  await bucket.put(wrongRow.object_key,'wrong');
+  const response=await request('/v1/blobs:pack','POST',encode({digests:[expired,healthy,wrong]}));
+  assert.equal(response.status,200,await response.clone().text());
+  assert.equal(response.headers.get('mbx-cache-pack-blobs'),'1');
+  assert.equal(response.headers.get('mbx-cache-pack-bytes'),String(healthy.size));
+  assert.equal(response.headers.get('content-length'),String(8+41+healthy.size));
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()),pack([[healthy,healthyBytes]]));
+  for(const d of [expired,wrong]) {
+    assert.equal(await db.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(key(d)).first(),null);
+    assert.equal(await db.prepare('SELECT namespace FROM namespace_blobs WHERE blob_key=?').bind(key(d)).first(),null);
+  }
+  // Subsequent downloads stay supported after pointer repair.
+  const again=await request('/v1/blobs:pack','POST',encode({digests:[healthy,expired]}));
+  assert.equal(again.status,200);
+  assert.deepEqual(Buffer.from(await again.arrayBuffer()),pack([[healthy,healthyBytes]]));
 });

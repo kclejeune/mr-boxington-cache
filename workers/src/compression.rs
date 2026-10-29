@@ -17,6 +17,7 @@ pub fn body(
     wire_limit: u64,
     decoded_limit: u64,
 ) -> Result<BodyStream> {
+    crate::routes::content_length(request, wire_limit)?;
     let encoding = request
         .headers()
         .get("content-encoding")?

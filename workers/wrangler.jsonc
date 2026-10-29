@@ -32,10 +32,24 @@
     "MBX_CACHE_MAX_BLOB_BYTES": "67108864",
     "MBX_CACHE_RETENTION_DAYS": "0",
     "MBX_CACHE_R2_PREFIX": "workers/v1",
-    "MBX_CACHE_CLEANUP_ENABLED": "false"
+    "MBX_CACHE_CLEANUP_ENABLED": "false",
+    "MBX_CACHE_RATE_LIMIT_MODE": "enforce",
+    "MBX_CACHE_CACHE_EPOCH": "v2",
+    "MBX_CACHE_D1_PRESENCE_RECONCILED": "false",
+    "MBX_CACHE_WORKERS_REQUEST_LIMIT_BYTES": "100000000"
   },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "head_sampling_rate": 1.0,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1.0,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1.0
+    }
   },
   "cache": {
     "enabled": true,
@@ -54,5 +68,81 @@
         "enabled": true
       }
     }
-  }
+  },
+  "workers_dev": false,
+  "preview_urls": false,
+  "ratelimits": [
+    {
+      "name": "MBX_LIMIT_READ",
+      "namespace_id": "1000",
+      "simple": {
+        "limit": 600,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_WRITE",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_BATCH",
+      "namespace_id": "1002",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_PACK",
+      "namespace_id": "1003",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_VALIDATION",
+      "namespace_id": "1004",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_LARGE",
+      "namespace_id": "1005",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_ANONYMOUS",
+      "namespace_id": "1006",
+      "simple": {
+        "limit": 20,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_BYTES",
+      "namespace_id": "1007",
+      "simple": {
+        "limit": 64,
+        "period": 60
+      }
+    },
+    {
+      "name": "MBX_LIMIT_ANONYMOUS_BYTES",
+      "namespace_id": "1008",
+      "simple": {
+        "limit": 4,
+        "period": 60
+      }
+    }
+  ]
 }

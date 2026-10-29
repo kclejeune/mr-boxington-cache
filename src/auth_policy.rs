@@ -37,6 +37,8 @@ pub struct TokenGrant {
 #[serde(deny_unknown_fields)]
 pub(crate) struct OidcProviderConfig {
     pub(crate) issuer: String,
+    #[serde(default)]
+    pub(crate) allow_insecure_loopback: bool,
     pub(crate) audiences: Vec<String>,
     #[serde(default)]
     pub(crate) discovery_uri: Option<String>,
@@ -129,11 +131,50 @@ pub(crate) fn validate_provider_config(config: &OidcProviderConfig) -> anyhow::R
     if config.issuer.is_empty() || config.audiences.is_empty() || config.rules.is_empty() {
         bail!("each OIDC provider requires issuer, audiences, and rules");
     }
-    if config.jwks_refresh_seconds == 0 {
-        bail!("OIDC jwks_refresh_seconds must be greater than zero");
+    for endpoint in std::iter::once(&config.issuer)
+        .chain(config.discovery_uri.iter())
+        .chain(config.jwks_uri.iter())
+    {
+        validate_endpoint(endpoint, config.allow_insecure_loopback)?;
     }
-    if config.rules.iter().any(|rule| rule.claims.is_empty()) {
-        bail!("each OIDC authorization rule must require at least one claim");
+    if config.jwks_refresh_seconds == 0
+        || config.jwks_refresh_seconds > 86400
+        || config.clock_skew_seconds > 300
+    {
+        bail!("OIDC refresh/skew outside supported bounds");
+    }
+    if config.audiences.len() > 32
+        || config.audiences.iter().any(|a| a.is_empty())
+        || config.rules.len() > 128
+    {
+        bail!("invalid OIDC audiences/rules");
+    }
+    for rule in &config.rules {
+        if rule.claims.is_empty()
+            || rule.claims.len() > 32
+            || rule.read.is_empty() && rule.write.is_empty()
+        {
+            bail!("OIDC rule requires claims and permissions");
+        }
+        validate_patterns(&rule.read)?;
+        validate_patterns(&rule.write)?;
+        for (name, requirement) in &rule.claims {
+            if name.is_empty()
+                || matches!(requirement, ClaimRequirement::Any(values) if values.is_empty() || values.len() > 128)
+            {
+                bail!("empty or excessive claim constraints");
+            }
+            let values = match requirement {
+                ClaimRequirement::One(value) => std::slice::from_ref(value),
+                ClaimRequirement::Any(values) => values,
+            };
+            if values
+                .iter()
+                .any(|v| matches!(v, ScalarValue::String(s) if s.is_empty()))
+            {
+                bail!("empty claim constraint");
+            }
+        }
     }
     Ok(())
 }
@@ -251,4 +292,33 @@ pub(crate) fn verify_jwt(
     Ok(decode::<Value>(token, &key, &validation)
         .context("validate JWT")?
         .claims)
+}
+
+pub(crate) fn validate_endpoint(
+    endpoint: &str,
+    allow_insecure_loopback: bool,
+) -> anyhow::Result<()> {
+    let url = url::Url::parse(endpoint).context("invalid OIDC endpoint")?;
+    let loopback = allow_insecure_loopback
+        && url.scheme() == "http"
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (url.scheme() != "https" && !loopback)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("OIDC endpoints must use HTTPS without credentials or fragments");
+    }
+    Ok(())
+}
+pub(crate) fn validate_patterns(patterns: &[String]) -> anyhow::Result<()> {
+    if patterns.len() > 128
+        || patterns
+            .iter()
+            .any(|p| p != "*" && !valid_namespace(p.strip_suffix("/*").unwrap_or(p)))
+    {
+        bail!("invalid namespace patterns");
+    }
+    Ok(())
 }

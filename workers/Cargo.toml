@@ -8,6 +8,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+url = "2"
 async-stream = "0.3"
 anyhow = "1"
 base64 = "0.23"

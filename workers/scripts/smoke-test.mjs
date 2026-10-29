@@ -10,8 +10,15 @@ const {values:{url,namespace}}=parseArgs({options:{url:{type:'string'},namespace
 assert.ok(url && namespace && process.env.MBX_REMOTE_TOKEN, 'provide --url, --namespace and MBX_REMOTE_TOKEN');
 const headers={'mbx-cache-protocol':'1','mbx-cache-namespace':namespace,
   authorization:`Bearer ${process.env.MBX_REMOTE_TOKEN}`};
+function requestMediaType(path,method) {
+  if(method==='PUT' && path.includes('/blobs/')) return 'application/octet-stream';
+  if(method==='PUT' && path.includes('/action-results/')) return 'application/vnd.mbx.cache-action-result.v1+json';
+  if(method==='PUT' && path.includes('/action-manifests/')) return 'application/vnd.mbx.cache-task-action-manifest.v1+json';
+  if(method==='POST' && ['/v1/blobs:missing','/v1/blobs:pack','/v1/action-results:batch'].includes(path)) return 'application/vnd.mbx.cache-digests.v1+json';
+  return 'application/json';
+}
 async function request(path,method='GET',body,extra={}) {
-  return fetch(url.replace(/\/$/,'')+path,{method,body,headers:{...headers,...extra},signal:AbortSignal.timeout(60_000)});
+  return fetch(url.replace(/\/$/,'')+path,{method,body,headers:{'content-type':requestMediaType(path,method),...headers,...extra},signal:AbortSignal.timeout(60_000)});
 }
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);

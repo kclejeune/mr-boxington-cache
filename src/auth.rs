@@ -431,6 +431,7 @@ mod tests {
             "issuer":"https://issuer.example",
             "audiences":["https://cache.example"],
             "jwks_uri":format!("http://{address}/jwks"),
+            "allow_insecure_loopback":true,
             "rules":[{"claims":{"repository":"jdx/mise"}, "read":["jdx/mise"]}]
         }]);
 
@@ -470,6 +471,7 @@ mod tests {
             "issuer":issuer,
             "audiences":["https://cache.example"],
             "jwks_uri":format!("http://{address}/jwks"),
+            "allow_insecure_loopback":true,
             "rules":[{
                 "claims":{"repository":"jdx/mise", "repository_owner_id":"216188"},
                 "read":["jdx/mise"],

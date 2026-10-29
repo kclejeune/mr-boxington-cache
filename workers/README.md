@@ -313,3 +313,112 @@ D1's per-invocation query limit. Existing large blobs remain downloadable even
 when larger than the configured upload limit. Choose an appropriate decoded
 upload limit for the instance; encoded uploads still face Cloudflare ingress
 limits.
+
+## Hardening and rollout
+
+The external gateway classifies every route before authentication. Unknown routes
+fail closed. Static grants, anonymous patterns, and OIDC providers are validated
+and cached as owned data. OIDC endpoints require HTTPS; redirects are manual,
+same-origin, limited to three hops, and share a ten-second deadline and 1 MiB
+response limit. An explicit provider-level `allow_insecure_loopback: true` permits HTTP only
+for localhost, 127.0.0.1, or ::1 development endpoints. HTTPS endpoints still
+cannot redirect to HTTP.
+
+Uploads remain limited to 64 MiB decoded bytes. Packs allow 256 members in the
+wire format, but this Worker advertises and accepts **16 items per batch/pack**
+to bound memory and amplification. The wire limit includes framing (8 + 41 bytes
+per member). `MBX_CACHE_WORKERS_REQUEST_LIMIT_BYTES` defaults to 100,000,000;
+configuration validation rejects advertised upload limits whose framing plus a
+1 MiB safety margin exceeds it. Set this to the actual account/zone ingress
+limit before raising blob limits. JSON action results are limited to 1 MiB; action batches have a
+16 MiB aggregate budget. Clients must send the protocol content type and split
+batches at the advertised item limit. Successful blob PUTs always return 204;
+pack receipts normalize successful members to `existing`, avoiding global
+existence disclosure. Fully verified pack bodies remain unreachable until final
+framing validates and one D1 transaction publishes metadata. Failed publication
+can leave temporary UUID objects for orphan cleanup.
+
+Action validation has a 64 MiB protocol-read budget, 4,096 directory limit,
+128-level depth limit, 100,000 total entry/reference limit, and the existing
+500-query backstop. Protocol-object reads combine membership and pointer lookup;
+stdout/stderr checks are batched. Directory traversal uses bulk-resolved breadth-first frontiers with at most
+16 MiB of bodies and six concurrent R2 reads. Topological validation detects
+cycles and enforces the longest-path depth, including shared subgraphs. Identical action replays return 204
+before dependency reads; conflicting replays return 409. Individual duplicate
+uploads still hash/drain the body to prove possession but avoid new R2 objects.
+Manifest ETags are preflighted and checked again atomically at publication.
+Blob GET/HEAD and pack members verify actual R2 sizes; stale pointers are removed
+with a primary-session compare-and-swap. Packs omit missing or wrong-sized members
+found during preflight and return the healthy members. An object disappearing
+after streaming starts still fails that stream. Imported blob GET/HEAD remain
+streamed without the upload-only u32 size restriction. Manifest GET verifies canonical BLAKE3
+before returning a body. Only successful internal immutable reads are cacheable.
+
+Action batches and pack downloads currently use bulk replica-eligible D1 lookup.
+This conservative initial policy bounds cold amplification without assuming a
+production cache hit ratio. Single immutable reads retain edge caching. Measure
+pack bytes, D1 rows/duration, and edge outcomes before adding a cache-first batch
+cutoff. The Rust D1 SDK exposes row/duration metadata but omits serving-region and
+primary/replica flags; verify those routing fields in Cloudflare diagnostics.
+
+Before deploying:
+
+1. Apply `migrations/0003_query_indexes.sql` off-peak. Local SQLite query-plan
+   checks are in `scripts/test_query_plans.py`; also verify staging D1 plans and
+   costs before enabling retention.
+2. Configure a protected custom hostname (`routes` with `custom_domain: true`).
+   Both `workers_dev` and `preview_urls` are disabled. The template deliberately
+   supplies no organization-specific hostname. Keep R2 private and enable D1
+   replication with `scripts/configure-d1.py`.
+3. Set `MBX_CACHE_PRINCIPAL_KEY` as a Worker secret containing at least 32 random
+   bytes, and keep `MBX_CACHE_TOKENS_JSON` in secrets. The keyed BLAKE3 identity is
+   stable across namespaces and never logged. OIDC identities use issuer+subject.
+   Anonymous readers share a tighter aggregate budget.
+4. Review the `MBX_LIMIT_*` bindings and choose account-unique namespace IDs.
+   Initial per-minute limits are 600 reads, 60 writes, 30 batch reads, 10 packs,
+   10 validations, 10 large reads, and 20 anonymous requests. A separate byte
+   budget reserves conservative upper bounds in 16 MiB units: 1 GiB/minute per
+   principal and 64 MiB/minute for all anonymous traffic. Failed requests consume
+   budget. Pack downloads reserve the validated requested artifact payload;
+   bounded framing/control overhead is covered by the request budget. Empty
+   packs reserve no payload units, and a full 64 MiB payload fits the default
+   anonymous byte allowance. These are initial ceilings to tune against CI traffic, not global
+   accounting guarantees. Use `MBX_CACHE_RATE_LIMIT_MODE=observe` during staging,
+   then `enforce` (the deployment default). `off` is for local tests/development.
+   Apply coarse per-IP WAF controls and an exact method/path allowlist on the
+   custom hostname, including status/capabilities and auth failures. Application
+   limits are approximate and location-local; strict global cost/concurrency
+   accounting requires a serialized service.
+5. Reconcile imported CAS content cryptographically (or verify/document the
+   trusted source's equivalent integrity guarantee), remove unrelated writers,
+   and exclude live prefixes from lifecycle expiration. Only then set
+   `MBX_CACHE_D1_PRESENCE_RECONCILED=true` to remove missing-query R2 HEADs.
+   It defaults to false and retains lifecycle-compatible presence checks.
+6. Keep cleanup disabled and retention at zero through cutover. Import prefixes
+   must never overlap the Worker-owned prefix: new manifest imports now use
+   `<worker-prefix>-imports/manifests/...`. Do not import or register old
+   UUID keys into `workers/v1`. Finish any older import workflow before enabling
+   cleanup. Reconcile old imported-manifest keys or keep cleanup off.
+7. Enable cleanup last, after a staging dry run. Each hourly sweep inspects up
+   to 1,000 objects and deletes at most 200, retaining a 24-hour grace period.
+   The initial full-scan SLO is 24 hours for at most 24,000 Worker-owned objects;
+   the orphan-lag target is 48 hours at that capacity with no deletion backlog.
+   Scale frequency/page budgets before exceeding that capacity. Cleanup logs
+   inspected/deleted counts, oldest deleted orphan age, and cursor continuation.
+   Imported prefixes require separate reconciliation/cleanup.
+
+Retention is **soft**: metadata deletion can leave authorized cached blobs
+available for up to 24 hours and action results for up to one hour. Credential
+revocation still applies on every request. Hard deletion requires cache purge or
+shared-cache disabling and separate acceptance tests before positive retention.
+Cache epoch `v2` separates the changed response semantics from earlier entries.
+A deployed smoke test must verify real HITs, namespace/action isolation in both
+warm orders, and a miss after changing only the trusted epoch. Miniflare does
+not implement the production cache pipeline and cannot prove that contract.
+
+Both production and local deployment configs enable invocation logs and traces
+with `head_sampling_rate: 1.0`. Avoid logging bearer tokens, claims, namespaces,
+or object keys in custom telemetry. Delegated direct-to-R2 uploads remain off. The adjacent `mr-boxington` checkout has a companion change that consumes
+`max_blob_bytes` before source reads or retries (including pack members). Its
+existing prerequisite handling prevents publication when those uploads fail.
+Ship that client change separately with the Worker rollout.

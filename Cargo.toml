@@ -27,6 +27,7 @@ path = "src/bin/mbx-cache-migrate.rs"
 required-features = ["migration"]
 
 [dependencies]
+url = "2"
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"

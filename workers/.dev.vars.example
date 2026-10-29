@@ -1,3 +1,6 @@
 MBX_CACHE_TOKENS_JSON='[{"token":"development-token","read":["default"],"write":["default"]}]'
 # Optional: same provider/rule JSON format as the native server.
 # MBX_CACHE_OIDC_PROVIDERS_JSON='[{"issuer":"https://token.actions.githubusercontent.com","audiences":["https://cache.example.com"],"rules":[{"claims":{"repository":"acme/project","repository_owner_id":"123"},"read":["default"],"write":[]}]}]'
+
+# Local development only; deployed environments require rate-limit bindings and a secret key.
+MBX_CACHE_RATE_LIMIT_MODE=off
