@@ -44,38 +44,47 @@ where
             .await?
             .is_some_and(|o| o.size() == digest.size)
     {
-        futures_util::pin_mut!(input);
-        let mut count = 0u64;
-        let mut blake3 = blake3::Hasher::new();
-        let mut sha256 = sha2::Sha256::new();
-        while let Some(chunk) = input.next().await {
-            let chunk = chunk?;
-            count = count
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| Error::new(413, "blob too large"))?;
-            if count > digest.size {
-                return Err(Error::new(413, "blob exceeds declared size"));
-            }
-            if digest.algorithm == "blake3" {
-                blake3.update(&chunk);
-            } else {
-                sha256.update(&chunk);
-            }
-        }
-        let hash = if digest.algorithm == "blake3" {
-            blake3.finalize().to_hex().to_string()
-        } else {
-            hex::encode(sha256.finalize())
-        };
-        if count != digest.size || hash != digest.hash {
-            return Err(Error::new(
-                400,
-                "content does not match the requested digest",
-            ));
-        }
+        verify(digest, input).await?;
         return Ok((key, false));
     }
     Ok((persist(store, digest, input).await?, true))
+}
+
+/// Drain and verify a duplicate frame without issuing an R2 write.
+pub async fn verify<S>(digest: &Digest, input: S) -> Result<()>
+where
+    S: Stream<Item = Result<Vec<u8>>>,
+{
+    futures_util::pin_mut!(input);
+    let mut count = 0u64;
+    let mut blake3 = blake3::Hasher::new();
+    let mut sha256 = sha2::Sha256::new();
+    while let Some(chunk) = input.next().await {
+        let chunk = chunk?;
+        count = count
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| Error::new(413, "blob too large"))?;
+        if count > digest.size {
+            return Err(Error::new(413, "blob exceeds declared size"));
+        }
+        if digest.algorithm == "blake3" {
+            blake3.update(&chunk);
+        } else {
+            sha256.update(&chunk);
+        }
+    }
+    let hash = if digest.algorithm == "blake3" {
+        blake3.finalize().to_hex().to_string()
+    } else {
+        hex::encode(sha256.finalize())
+    };
+    if count != digest.size || hash != digest.hash {
+        return Err(Error::new(
+            400,
+            "content does not match the requested digest",
+        ));
+    }
+    Ok(())
 }
 
 pub async fn persist<S>(store: &Store, digest: &Digest, input: S) -> Result<String>

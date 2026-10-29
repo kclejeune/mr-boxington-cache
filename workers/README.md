@@ -100,11 +100,12 @@ D1 query capacity, and the configured CPU budget.
   `MBX_CACHE_MAX_BLOB_BYTES` (1 through 4,294,967,295). Keep it below the request
   limit for your Cloudflare zone, allowing for pack framing. Streaming does not
   bypass ingress limits. There is no multi-request upload or content chunking.
-- Batches advertise at most 256 members. D1 JSON-list joins avoid the bound
-  parameter limit. Validation batches file memberships, and caps its D1 work
+- Batches advertise at most 16 members. D1 JSON-list CROSS JOINs keep the
+  requested keys outermost and use full-key index lookups without hitting the
+  bound parameter limit. Validation batches file memberships, and caps its D1 work
   at 500 queries per action commit; larger actions return 422 without publication.
-- JSON requests are bounded at 2 MiB; manifests and individual protocol objects
-  at 16 MiB. Large protocol objects are buffered for schema validation and
+- JSON action results and digest lists are bounded at 1 MiB; manifests and
+  individual protocol objects at 16 MiB. Large protocol objects are buffered for schema validation and
   canonicalization; artifact bodies are streamed. Benchmark concurrent large
   manifests/trees before using the full object-size limits in production.
 - Manifest bodies live in R2; D1 stores the current pointer and canonical BLAKE3
@@ -218,8 +219,10 @@ key set, and 16 KiB bearer tokens are accepted. Use HTTPS for provider endpoints
 
 ## Upload publication and retention
 
-Each upload streams into a fresh private R2 key. A D1 transaction publishes the
-winning verified object pointer and namespace membership only after R2 and
+New content streams into a fresh private R2 key. Duplicate single and pack
+uploads hash and drain the supplied content while reusing healthy object pointers.
+A D1 transaction publishes the winning verified object pointer and namespace
+membership only after R2 and
 verification succeed. Concurrent identical uploads retain one object. Invalid
 uploads never gain visibility, and cleanup only deletes their own unique key.
 D1 failures can leave unreachable objects, which scheduled cleanup reclaims.
@@ -231,9 +234,9 @@ defaults to `0` (no expiration). A positive value removes up to 200 old blobs,
 on object creation, not download recency. A result referencing an expired blob
 may remain until its own expiration; clients treat failed restores as misses.
 
-The same handler lists up to 100 R2 objects per invocation, with its cursor in
-D1. Objects unreferenced by either blob metadata or a manifest pointer are
-removed after a 24-hour grace period. This reclaims superseded manifests,
+The same handler inspects up to 1,000 R2 objects and deletes at most 200 per
+invocation, with its cursor in D1. Objects unreferenced by either blob metadata
+or a manifest pointer are removed after a 24-hour grace period. This reclaims superseded manifests,
 failed uploads, and expired blobs without racing active uploads or readers of
 recent manifest versions. Cleanup throughput is deliberately bounded; tune the
 schedule/page sizes for sustained workloads. Keep any legacy R2 expiration rules scoped to the native prefix, and use the
@@ -308,9 +311,9 @@ bucket. For the gateway instance, that is `mbx-cache/v1/`, while new Worker
 objects live under `workers/v1/`. Missing-blob queries check R2 availability,
 and verified uploads can replace expired D1 object pointers atomically.
 
-The batch limit is 256 to leave room for pointer lookups and repairs within
-D1's per-invocation query limit. Existing large blobs remain downloadable even
-when larger than the configured upload limit. Choose an appropriate decoded
+The batch limit is 16 to bound pointer lookups, repairs, memory, and amplification
+within D1's per-invocation query limit. Existing large blobs remain downloadable
+even when larger than the configured upload limit. Choose an appropriate decoded
 upload limit for the instance; encoded uploads still face Cloudflare ingress
 limits.
 
@@ -331,12 +334,17 @@ per member). `MBX_CACHE_WORKERS_REQUEST_LIMIT_BYTES` defaults to 100,000,000;
 configuration validation rejects advertised upload limits whose framing plus a
 1 MiB safety margin exceeds it. Set this to the actual account/zone ingress
 limit before raising blob limits. JSON action results are limited to 1 MiB; action batches have a
-16 MiB aggregate budget. Clients must send the protocol content type and split
-batches at the advertised item limit. Successful blob PUTs always return 204;
+16 MiB aggregate budget. The integration suite exercises sixteen 1 MiB stored
+JSON rows and rejects an oversized row; production concurrency and cache behavior
+still require deployed acceptance testing. Clients must send the protocol content
+type and split batches at the advertised item limit. Successful blob PUTs always return 204;
 pack receipts normalize successful members to `existing`, avoiding global
 existence disclosure. Fully verified pack bodies remain unreachable until final
-framing validates and one D1 transaction publishes metadata. Failed publication
-can leave temporary UUID objects for orphan cleanup.
+framing validates and one D1 transaction publishes metadata. Parsing or verification
+failures immediately attempt to remove only newly staged UUID objects; reused
+objects are preserved. Cleanup failures and uncertain D1 publication outcomes
+can leave temporary objects for reference-aware orphan cleanup. Never delete
+staged objects merely because a D1 response failed: publication may have committed.
 
 Action validation has a 64 MiB protocol-read budget, 4,096 directory limit,
 128-level depth limit, 100,000 total entry/reference limit, and the existing
@@ -344,8 +352,10 @@ Action validation has a 64 MiB protocol-read budget, 4,096 directory limit,
 stdout/stderr checks are batched. Directory traversal uses bulk-resolved breadth-first frontiers with at most
 16 MiB of bodies and six concurrent R2 reads. Topological validation detects
 cycles and enforces the longest-path depth, including shared subgraphs. Identical action replays return 204
-before dependency reads; conflicting replays return 409. Individual duplicate
-uploads still hash/drain the body to prove possession but avoid new R2 objects.
+before dependency reads; conflicting replays return 409. Duplicate single and pack
+uploads still hash/drain every body/frame to prove possession but avoid R2 PUTs
+and DELETEs when the stored object is healthy. Repeated members within a pack
+reuse its already verified staged object.
 Manifest ETags are preflighted and checked again atomically at publication.
 Blob GET/HEAD and pack members verify actual R2 sizes; stale pointers are removed
 with a primary-session compare-and-swap. Packs omit missing or wrong-sized members
@@ -388,7 +398,9 @@ Before deploying:
    Apply coarse per-IP WAF controls and an exact method/path allowlist on the
    custom hostname, including status/capabilities and auth failures. Application
    limits are approximate and location-local; strict global cost/concurrency
-   accounting requires a serialized service.
+   accounting requires a serialized service. OIDC discovery/JWKS work precedes
+   the principal limiter, so these edge controls must also cover unauthenticated
+   and invalid-token requests; principal budgets do not replace them.
 5. Reconcile imported CAS content cryptographically (or verify/document the
    trusted source's equivalent integrity guarantee), remove unrelated writers,
    and exclude live prefixes from lifecycle expiration. Only then set
@@ -406,6 +418,15 @@ Before deploying:
    Scale frequency/page budgets before exceeding that capacity. Cleanup logs
    inspected/deleted counts, oldest deleted orphan age, and cursor continuation.
    Imported prefixes require separate reconciliation/cleanup.
+8. Review GitHub pull-request write grants explicitly. The local provider policy
+   permits `pull_request` identities to write `kclejeune/sparkles`; its claims do
+   not establish that the PR source repository is trusted. Keep **Send write
+   tokens to workflows from pull requests** disabled and restrict workflow remote
+   writes to same-repository PRs. For read-only PR access, remove `write` grants
+   from the `pull_request` rule; the base repository rule already grants reads.
+   Do not rely on ordinary fork defaults if administrators can enable write tokens.
+   See [GitHub OIDC](https://docs.github.com/en/actions/reference/security/oidc)
+   and [workflow permission calculation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#how-permissions-are-calculated-for-a-workflow-job).
 
 Retention is **soft**: metadata deletion can leave authorized cached blobs
 available for up to 24 hours and action results for up to one hour. Credential

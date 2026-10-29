@@ -58,12 +58,13 @@ impl Store {
     }
     pub async fn visible_blobs(&self, namespace: &str, digests: &[Digest]) -> Result<Vec<Digest>> {
         let mut visible = HashSet::new();
+        // CROSS JOIN keeps the bounded request list outermost, forcing full-key lookups.
         // Bound JSON size and result materialization independently of protocol batch size.
         for chunk in digests.chunks(1000) {
             let keys = serde_json::to_string(&chunk.iter().map(Digest::key).collect::<Vec<_>>())?;
             let rows = self.statement(
                 "SELECT requested.value AS blob_key FROM json_each(?2) AS requested \
-                 JOIN namespace_blobs AS blobs ON blobs.namespace=?1 AND blobs.blob_key=requested.value",
+                 CROSS JOIN namespace_blobs AS blobs ON blobs.namespace=?1 AND blobs.blob_key=requested.value",
                 &[namespace, &keys])?.all().await?.results::<KeyRow>()?;
             visible.extend(rows.into_iter().map(|row| row.blob_key));
         }
@@ -87,7 +88,7 @@ impl Store {
             object_key: String,
         }
         let keys = serde_json::to_string(&digests.iter().map(Digest::key).collect::<Vec<_>>())?;
-        let result = self.statement("SELECT o.blob_key,o.object_key FROM json_each(?2) r JOIN namespace_blobs b ON b.namespace=?1 AND b.blob_key=r.value JOIN blob_objects o ON o.blob_key=b.blob_key", &[namespace,&keys])?.all().await?;
+        let result = self.statement("SELECT o.blob_key,o.object_key FROM json_each(?2) r CROSS JOIN namespace_blobs b ON b.namespace=?1 AND b.blob_key=r.value CROSS JOIN blob_objects o ON o.blob_key=b.blob_key", &[namespace,&keys])?.all().await?;
         log_meta(&result)?;
         Ok(result
             .results::<Object>()?
@@ -121,7 +122,7 @@ impl Store {
             object_key: String,
         }
         let keys = serde_json::to_string(&digests.iter().map(Digest::key).collect::<Vec<_>>())?;
-        let rows=self.statement("SELECT o.blob_key,o.object_key FROM json_each(?2) r JOIN namespace_blobs b ON b.namespace=?1 AND b.blob_key=r.value JOIN blob_objects o ON o.blob_key=b.blob_key",&[namespace,&keys])?.all().await?.results::<ObjectRow>()?;
+        let rows=self.statement("SELECT o.blob_key,o.object_key FROM json_each(?2) r CROSS JOIN namespace_blobs b ON b.namespace=?1 AND b.blob_key=r.value CROSS JOIN blob_objects o ON o.blob_key=b.blob_key",&[namespace,&keys])?.all().await?.results::<ObjectRow>()?;
         let found = stream::iter(rows)
             .map(|row| async move {
                 let object = self.bucket.head(&row.object_key).await?;
@@ -164,7 +165,7 @@ impl Store {
             blob_key: String,
             object_key: String,
         }
-        let pointers = self.statement("SELECT b.blob_key,b.object_key FROM blob_objects b JOIN json_each(?1) r ON b.blob_key=json_extract(r.value,'$.blob')", &[&json])?.all().await?.results::<Pointer>()?;
+        let pointers = self.statement("SELECT b.blob_key,b.object_key FROM json_each(?1) r CROSS JOIN blob_objects b ON b.blob_key=json_extract(r.value,'$.blob')", &[&json])?.all().await?.results::<Pointer>()?;
         for pointer in pointers {
             if let Some((digest, key, fresh)) =
                 staged.iter().find(|(d, _, _)| d.key() == pointer.blob_key)
@@ -183,8 +184,8 @@ impl Store {
         let results = self.db.batch(vec![
             self.statement("INSERT INTO blob_objects(blob_key,object_key) SELECT json_extract(value,'$.blob'),json_extract(value,'$.object') FROM json_each(?1) WHERE json_extract(value,'$.fresh')=1 ON CONFLICT DO NOTHING", &[&json])?,
             self.statement("UPDATE blob_objects SET object_key=json_extract(r.value,'$.object'),created_at=unixepoch() FROM json_each(?1) r WHERE blob_key=json_extract(r.value,'$.blob') AND object_key=json_extract(r.value,'$.previous')", &[&repairs])?,
-            self.statement("INSERT INTO namespace_blobs(namespace,blob_key) SELECT ?1,b.blob_key FROM json_each(?2) r JOIN blob_objects b ON b.blob_key=json_extract(r.value,'$.blob') WHERE true ON CONFLICT DO NOTHING", &[namespace,&json])?,
-            self.statement("SELECT b.blob_key,b.object_key FROM blob_objects b JOIN json_each(?1) r ON b.blob_key=json_extract(r.value,'$.blob')", &[&json])?,
+            self.statement("INSERT INTO namespace_blobs(namespace,blob_key) SELECT ?1,b.blob_key FROM json_each(?2) r CROSS JOIN blob_objects b ON b.blob_key=json_extract(r.value,'$.blob') WHERE true ON CONFLICT DO NOTHING", &[namespace,&json])?,
+            self.statement("SELECT b.blob_key,b.object_key FROM json_each(?1) r CROSS JOIN blob_objects b ON b.blob_key=json_extract(r.value,'$.blob')", &[&json])?,
         ]).await?;
         #[derive(Deserialize)]
         struct Winner {
@@ -225,7 +226,7 @@ impl Store {
         for chunk in digests.chunks(16) {
             let keys = serde_json::to_string(&chunk.iter().map(Digest::key).collect::<Vec<_>>())?;
             let response = self.statement(
-                "SELECT results.result FROM json_each(?2) AS requested JOIN action_results AS results \
+                "SELECT results.result FROM json_each(?2) AS requested CROSS JOIN action_results AS results \
                  ON results.namespace=?1 AND results.action_key=requested.value", &[namespace,&keys])?
                 .all().await?;
             log_meta(&response)?;

@@ -65,11 +65,12 @@ function jwt(claims={},options={}) {
       algorithm.startsWith('PS')?{key,padding:cconst.RSA_PKCS1_PSS_PADDING,saltLength:algorithm.endsWith('384')?48:algorithm.endsWith('512')?64:32}:key);
   return `${input}.${signature.toString('base64url')}`;
 }
-function runtime(bindings={}, ratelimits={}) {
+function runtime(bindings={}, ratelimits={}, instrument=false) {
   const options=convertV4MiniflareOptions({ workers: [{
     name: "mbx-cache",
     modulesRoot: root,
     modules: [
+      ...(instrument ? [{type:'ESModule',path:`${root}tests/instrumented-entry.mjs`}] : []),
       {type:'ESModule',path:`${root}entry.js`},
       {type:'ESModule',path:`${root}build/index.js`},
       {type:'CompiledWasm',path:`${root}build/index_bg.wasm`},
@@ -256,6 +257,91 @@ test('rejects corrupt and truncated packs without publishing earlier verified fr
   assert.equal((await request(path('blobs',entries[1][0]))).status,404);
   const truncated=await request('/v1/blobs:pack-upload','POST',pack(entries).subarray(0,30),packHeaders(entries));
   assert.equal(truncated.status,400);
+});
+
+test('pack replays hash every frame without R2 PUT/DELETE churn, and malformed packs clean up fresh objects', async () => {
+  const fixture=runtime({}, {}, true);
+  try {
+    const database=await fixture.getD1Database('MBX_DB'),storage=await fixture.getR2Bucket('MBX_BLOBS');
+    const schema=await readFile(`${root}migrations/0001_init.sql`,'utf8');
+    for(const sql of schema.replace(/^--.*$/gm,'').split(';').filter(s=>s.trim())) await database.prepare(sql).run();
+    const call=(entries,namespace='test/project',body=pack(entries))=>fixture.dispatchFetch('https://cache.example/v1/blobs:pack-upload',{
+      method:'POST',body,headers:{...packHeaders(entries),'mbx-cache-protocol':'1','mbx-cache-namespace':namespace,authorization:'Bearer test-token'},
+    });
+    const ops=async()=>await (await fixture.dispatchFetch('https://cache.example/__test/r2-operations')).json();
+    const entries=[['replay-blake3','blake3'],['replay-sha256','sha256'],['','blake3']].map(([s,a])=>[digest(s,a),Buffer.from(s)]);
+    const repeated=[...entries,entries[0]];
+    const first=await call(repeated);
+    assert.equal(first.status,200,await first.clone().text());
+    assert.deepEqual(await ops(),{put:3,delete:0}); // Includes same-pack deduplication.
+    const objects=(await storage.list()).objects.map(o=>o.key).sort();
+    for(const namespace of ['test/project','test/cross-namespace']) {
+      const replay=await call(repeated,namespace);
+      assert.equal(replay.status,200,await replay.clone().text());
+      assert.deepEqual(await replay.json(),{created:0,existing:4});
+      const memberships=await database.prepare('SELECT count(*) AS n FROM namespace_blobs WHERE namespace=?').bind(namespace).first();
+      assert.equal(memberships.n,3);
+    }
+    // A known digest must still prove possession; it cannot publish a new membership.
+    const corrupt=[[entries[0][0],Buffer.alloc(entries[0][0].size)]];
+    assert.equal((await call(corrupt,'test/corrupt-replay')).status,400);
+    assert.deepEqual(await ops(),{put:3,delete:0});
+    assert.equal((await database.prepare("SELECT count(*) AS n FROM namespace_blobs WHERE namespace='test/corrupt-replay'").first()).n,0);
+
+    for(const failure of ['hash','algorithm','truncated','trailing','declared']) {
+      const fresh=Buffer.from(`fresh-before-${failure}`),tail=Buffer.from(`tail-${failure}`);
+      const frames=[entries[0],[digest(fresh),fresh],[digest(tail),tail]];
+      let body=pack(frames);
+      if(failure==='hash') body[body.length-1]^=1;
+      if(failure==='algorithm') body[8+41+entries[0][0].size+41+fresh.length]=255;
+      if(failure==='truncated') body=body.subarray(0,body.length-tail.length-20);
+      if(failure==='trailing') body=Buffer.concat([body,Buffer.from([1])]);
+      if(failure==='declared') frames[2]=[{...frames[2][0],size:tail.length+1},tail];
+      const response=await call(frames,'test/invalid-pack',body);
+      assert.ok([400,413].includes(response.status),`${failure}: ${response.status}: ${await response.text()}`);
+      assert.deepEqual((await storage.list()).objects.map(o=>o.key).sort(),objects,failure);
+      assert.equal((await database.prepare("SELECT count(*) AS n FROM namespace_blobs WHERE namespace='test/invalid-pack'").first()).n,0);
+    }
+    // Lifecycle-expired pointers remain repairable through the duplicate-aware path.
+    const pointer=await database.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(`${entries[1][0].algorithm}/${entries[1][0].hash}/${entries[1][0].size}`).first();
+    await storage.delete(pointer.object_key);
+    const before=await ops();
+    assert.equal((await call([entries[1]])).status,200);
+    assert.equal((await ops()).put,before.put+1);
+    const repaired=await database.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?').bind(`${entries[1][0].algorithm}/${entries[1][0].hash}/${entries[1][0].size}`).first();
+    assert.notEqual(repaired.object_key,pointer.object_key);
+    assert.deepEqual(Buffer.from(await (await storage.get(repaired.object_key)).arrayBuffer()),entries[1][1]);
+
+    // A lost publication response cannot justify deleting content D1 already exposes.
+    const uncertain=Buffer.from('published-despite-lost-response'),uncertainDigest=digest(uncertain);
+    await fixture.dispatchFetch('https://cache.example/__test/fail-after-publication');
+    const beforeFailure=await ops();
+    assert.equal((await call([[uncertainDigest,uncertain]])).status,500);
+    const committed=await database.prepare('SELECT object_key FROM blob_objects WHERE blob_key=?')
+      .bind(`${uncertainDigest.algorithm}/${uncertainDigest.hash}/${uncertainDigest.size}`).first();
+    assert.ok(committed);
+    assert.deepEqual(Buffer.from(await (await storage.get(committed.object_key)).arrayBuffer()),uncertain);
+    assert.equal((await ops()).delete,beforeFailure.delete);
+  } finally { await fixture.dispose(); }
+});
+
+test('action batches accept sixteen 1 MiB stored JSON rows and reject oversized rows', async () => {
+  const limit=1024*1024;
+  const records=Array.from({length:16},(_,i)=>{
+    const action=digest(`maximum-batch-action-${i}`),result={action,metadata:null,output_root:null,version:1};
+    const json=JSON.stringify(result);
+    // Imported JSON may contain whitespace. Exercise the full D1 string/parse budget.
+    return {action,result,json:json+' '.repeat(limit-Buffer.byteLength(json))};
+  });
+  await db.batch(records.map(({action,json})=>db.prepare('INSERT INTO action_results(namespace,action_key,result) VALUES (?,?,?)')
+    .bind('test/maximum-batch',`${action.algorithm}/${action.hash}/${action.size}`,json)));
+  const fetchBatch=()=>request('/v1/action-results:batch','POST',encode({digests:records.map(r=>r.action)}),{'mbx-cache-namespace':'test/maximum-batch'});
+  const response=await fetchBatch();
+  assert.equal(response.status,200,await response.clone().text());
+  assert.equal((await response.json()).results.length,16);
+  await db.prepare("UPDATE action_results SET result=result || ' ' WHERE namespace=? AND action_key=?")
+    .bind('test/maximum-batch',`${records[0].action.algorithm}/${records[0].action.hash}/${records[0].action.size}`).run();
+  assert.equal((await fetchBatch()).status,413);
 });
 
 test('validates action trees before immutable publication and supports batched reads', async () => {

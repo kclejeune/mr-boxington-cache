@@ -609,41 +609,64 @@ async fn upload_pack(request: &mut Request, store: &Store, namespace: &str) -> R
         return Err(Error::new(400, "invalid blob pack magic"));
     }
     let mut total = 0u64;
-    let mut staged = Vec::new();
-    for _ in 0..count {
-        let h = input.exact(41).await?;
-        let algorithm = match h[0] {
-            1 => "blake3",
-            2 => "sha256",
-            _ => return Err(Error::new(400, "invalid pack algorithm")),
-        };
-        let size = u64::from_be_bytes(h[33..41].try_into().unwrap());
-        total = total
-            .checked_add(size)
-            .ok_or_else(|| Error::new(413, "pack too large"))?;
-        if total > declared {
-            return Err(Error::new(400, "pack exceeds declared bytes"));
-        }
-        let digest = Digest {
-            algorithm: algorithm.into(),
-            hash: hex::encode(&h[1..33]),
-            size,
-        };
-        let input_ref = &mut input;
-        let frame = async_stream::try_stream! {
-            let mut remaining=size;
-            while remaining>0 {
-                let chunk=input_ref.take(remaining.min(64*1024) as usize).await?
-                    .ok_or_else(|| Error::new(400,"truncated blob pack"))?;
-                remaining-=chunk.len() as u64; yield chunk;
+    let mut staged: Vec<(Digest, String, bool)> = Vec::new();
+    let verified: Result<()> = async {
+        for _ in 0..count {
+            let h = input.exact(41).await?;
+            let algorithm = match h[0] {
+                1 => "blake3",
+                2 => "sha256",
+                _ => return Err(Error::new(400, "invalid pack algorithm")),
+            };
+            let size = u64::from_be_bytes(h[33..41].try_into().unwrap());
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| Error::new(413, "pack too large"))?;
+            if total > declared {
+                return Err(Error::new(400, "pack exceeds declared bytes"));
             }
-        };
-        let key = upload::persist(store, &digest, frame).await?;
-        staged.push((digest, key, true));
+            let digest = Digest {
+                algorithm: algorithm.into(),
+                hash: hex::encode(&h[1..33]),
+                size,
+            };
+            let input_ref = &mut input;
+            let frame = async_stream::try_stream! {
+                let mut remaining=size;
+                while remaining>0 {
+                    let chunk=input_ref.take(remaining.min(64*1024) as usize).await?
+                        .ok_or_else(|| Error::new(400,"truncated blob pack"))?;
+                    remaining-=chunk.len() as u64; yield chunk;
+                }
+            };
+            // Reuse verified frames within this pack as well as previously published blobs.
+            let (key, fresh) = if let Some((_, key, _)) =
+                staged.iter().find(|(previous, _, _)| previous == &digest)
+            {
+                upload::verify(&digest, frame).await?;
+                (key.clone(), false)
+            } else {
+                upload::stage(store, &digest, frame).await?
+            };
+            staged.push((digest, key, fresh));
+        }
+        if total != declared || input.take(1).await?.is_some() {
+            return Err(Error::new(400, "pack contradicts declared headers"));
+        }
+        Ok(())
     }
-    if total != declared || input.take(1).await?.is_some() {
-        return Err(Error::new(400, "pack contradicts declared headers"));
+    .await;
+    if let Err(error) = verified {
+        // No metadata publication was attempted: only our fresh UUIDs are safe to delete.
+        for (_, key, fresh) in &staged {
+            if *fresh && store.bucket.delete(key).await.is_err() {
+                worker::console_error!("mbx.pack_cleanup_failed");
+            }
+        }
+        return Err(error);
     }
+    // A failed D1 response may still have committed. Preserve these objects for the
+    // reference-aware orphan sweep rather than risking deletion of published content.
     store.register_many(namespace, &staged).await?;
     media_json(
         &serde_json::json!({"created":0,"existing":count}),
